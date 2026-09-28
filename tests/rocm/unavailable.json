@@ -1,0 +1,21 @@
+{
+  "_comment": "Tests whose reference or input artifact upstream does not publish here. Each entry keeps the test RUNNING: 'signature' must match the test's own output for it to count as skipped. A different failure is reported as a failure, so this file cannot hide a regression.",
+  "tests": {
+    "ple_parity": {
+      "signature": "required PLE table is missing",
+      "reason": "needs the model's PLE lookup table from the GSQ-RCO weight shards. The Stage 3 feasibility gate has passed; the download is now awaiting the user's decision (MODEL-DOWNLOAD-PROPOSAL.md)."
+    },
+    "native_expert_parity": {
+      "signature": "usage: native_expert_parity",
+      "reason": "builds, but its reference compares CPU and GPU experts on real GGUF rows, so it needs a model shard. The Stage 3 feasibility gate has passed; the download is now awaiting the user's decision (MODEL-DOWNLOAD-PROPOSAL.md)."
+    },
+    "prefill_mmq_parity": {
+      "signature": "prefill_mmq_parity SKIPPED .*: missing reference path",
+      "reason": "IQ2_XXS and IQ2_XS cannot be quantized by ggml's public reference API without an importance matrix (the known gap TASKS.md tracks as S3.2b'), so those cases run zero comparisons and are a live skip, not a pass. The other six types run in the same binary."
+    },
+    "native_mmvq_q5k_parity": {
+      "signature": "native_mmvq_q5k_parity SKIPPED .*: missing reference path",
+      "reason": "ggml exposes no Q5_K reference decoder traits in this build, so the affected case would run zero comparisons. Currently not triggering (Q5_K traits are present); declared so a regression can surface as a skip, never as a pass."
+    }
+  }
+}
