@@ -1,0 +1,69 @@
+Fix the device arch id the MMQ path reads (rollout patch 0003).
+ggml keys MMQ instance selection on ggml_cuda_info().devices[].cc; this
+shim derived it with CUDA's 100*major+10*minor encoding, which is not a
+valid AMD arch id, so every MMQ launch aborted. Uses ggml's own parser.
+Rationale: PORTING.md section 6g.
+--- a/src/prefill/ggml_cuda_host.cu
++++ b/src/prefill/ggml_cuda_host.cu
+@@ -5,6 +5,7 @@
+ 
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <mutex>
+ #include <vector>
+ 
+@@ -12,6 +13,44 @@
+     std::fprintf(stderr, "ggml-cuda (strata mmq): %s: %s\n  in %s at %s:%d\n", msg, stmt, func, file, line);
+     std::abort();
+ }
++
++namespace {
++// ggml-cuda.cu's own ggml_cuda_parse_id, copied verbatim (MIT, same tree).
++//
++// This file computes the device info ggml's MMQ kernels read, and the value that
++// matters is `cc`: ggml keys MMQ instance selection on it. The CUDA encoding is
++// 100*major + 10*minor, which on AMD yields 1110 for gfx1100 and matches NO ggml
++// MMQ configuration, so every launch aborts with "no device code compatible".
++//
++// ggml's own HIP path does not use major/minor at all: it parses the GCN arch
++// string into GGML_CUDA_CC_OFFSET_AMD + hex digits. Doing anything else here made
++// the entire prompt MMQ path unusable on AMD.
++int strata_mmq_parse_gcn_arch(const char * devName) {
++    int archMajor = 0x0;
++    int archMinor = 0x0;
++    int archNum = GGML_CUDA_CC_OFFSET_AMD;
++    const int archLen = (int) std::strlen(devName);
++    char archName[64];
++    if (archLen >= (int) sizeof(archName)) return archNum;
++    std::strcpy(archName, devName);
++
++    char * name = archName;
++    int len = archLen;
++    if (len > 3) { name = archName + 3; len -= 3; }        // strip leading 'gfx'
++
++    len = (int) strcspn(name, ":");                        // trim :xnack- / :sramecc-
++    name[len] = '\0';
++
++    if (len >= 3) {
++        archMinor = (int) strtoul(&name[len - 2], 0, 16);  // minor*0x10 + stepping
++        name[len - 2] = '\0';
++        archMajor = (int) strtoul(name, 0, 16);
++    }
++    archNum += archMajor * 0x100;
++    archNum += archMinor;
++    return archNum;
++}
++}  // namespace
+ 
+ int ggml_cuda_get_device() {
+     int id = 0;
+@@ -31,7 +70,7 @@
+             hipDeviceProp_t prop;
+             CUDA_CHECK(hipGetDeviceProperties(&prop, id));
+             auto & d = in.devices[id];
+-            d.cc = 100 * prop.major + 10 * prop.minor;
++            d.cc = strata_mmq_parse_gcn_arch(prop.gcnArchName);
+             d.nsm = prop.multiProcessorCount;
+             d.smpb = prop.sharedMemPerBlock;
+             d.smpbo = prop.sharedMemPerBlockOptin;
