@@ -1,0 +1,130 @@
+Rollout patch 0006: a file-backed (mmap) expert source for IQ/native packs.
+
+--mmap-experts used to be Q2_0-only: FileExpertSource demands uniform
+BLOB-sized experts.bin (the Q2_0 relayout), while iq_pack --experts-bin writes
+the per-layer blob layout the ARENA uses - so IQ packs had no RAM-safe source
+and the engine pinned a 47.9 GiB hipHostRegister arena, which OOM-killed the
+machine four times under a 96 GiB desktop load. ArenaExpertSource already reads
+that exact layout; this patch adds a file-backed mode (set_file_backed) that
+mmaps experts.bin and points base_ at the mapping: same bytes, same blob()
+offsets, zero pinned RAM, page cache reclaimable. Unpinned by design:
+pinned()/device_alias() report false/nullptr and the CPU pool computes experts
+(upstream's documented mmap trade, now available for IQ). generate.cpp routes
+--mmap-experts to it for native packs. Validation: A/B one-shot, greedy, arena
+vs file-backed - identical output ids (results/record-expertsource-ab.json).
+
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -628,6 +628,40 @@
+     const int64_t blob = (int64_t) lay.max_blob;
+     const uint64_t want = lay.total;
+ 
++    // rollout patch 0006: the file-backed arm. experts.bin (canonical or iq_pack --experts-bin) is already
++    // in this class's blob layout - lay.total bytes, per-layer strides - so mapping it and pointing base_
++    // at the mapping is byte-for-byte the same view the arena would hold, without 47 GiB of pinned anon.
++    // Unpinned by design: pinned()/device_alias() report false/nullptr and the CPU pool computes experts.
++    if (file_backed_) {
++        const std::string fpath = pack_dir + "/experts.bin";
++        const int fd = ::open(fpath.c_str(), O_RDONLY);
++        if (fd < 0) { err = "ArenaExpertSource: cannot open " + fpath + " (file-backed mode needs the iq_pack --experts-bin output)"; return false; }
++        struct stat ms{};
++        if (fstat(fd, &ms) != 0) { ::close(fd); err = "ArenaExpertSource: cannot stat " + fpath; return false; }
++        if ((uint64_t) ms.st_size != want) {
++            char buf[400];
++            std::snprintf(buf, sizeof buf,
++                          "ArenaExpertSource: %s is %llu B but this geometry's expert layout is %llu B - "
++                          "this is not the pack this geometry came from",
++                          fpath.c_str(), (unsigned long long) ms.st_size, (unsigned long long) want);
++            ::close(fd);
++            err = buf;
++            return false;
++        }
++        void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
++        if (view == MAP_FAILED) { ::close(fd); err = "ArenaExpertSource: mmap failed on " + fpath; return false; }
++        map_fd_ = fd;
++        map_bytes_ = want;
++        base_ = (const uint8_t*) view;
++        blobs_ = n_layers * n_expert;
++        n_expert_ = n_expert;
++        reads_ = 0;
++        pinned_bytes_ = 0;
++        note_ = "experts via mmap of experts.bin (file-backed, unpinned; the page cache holds the hot set)";
++        gib_per_s_ = 0.0;
++        return true;
++    }
++
+     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
+     const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
+     // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend
+@@ -697,6 +731,12 @@
+ }
+ 
+ void ArenaExpertSource::close() {
++    if (map_fd_ >= 0) {
++        if (base_ != nullptr) munmap((void*) base_, (size_t) map_bytes_);
++        ::close(map_fd_);
++        map_fd_ = -1;
++        map_bytes_ = 0;
++    }
+     if (arena_ != nullptr) {
+         delete (PinnedArena*) arena_;
+         arena_ = nullptr;
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -323,6 +323,13 @@
+     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads, std::string& err);
+     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's shard 1.
+     void set_gguf(const std::string& shard1) { gguf_ = shard1; }
++    /// Rollout patch 0006: serve the experts from a read-only mapping of experts.bin instead of a copied,
++    /// registered arena. Same layout, same bytes, zero pinned RAM - the page cache holds the hot set and
++    /// the kernel can reclaim it under pressure. The trade is upstream's documented mmap trade: no PCIe
++    /// device aliases (the CPU pool computes; nothing DMAs weights), and the rate depends on page-cache
++    /// retention. For IQ/native packs this is the only RAM-safe source; FileExpertSource stays the
++    /// Q2_0-uniform-blob path.
++    void set_file_backed(bool on) { file_backed_ = on; }
+     void close();
+ 
+     bool mapped() const { return base_ != nullptr; }
+@@ -339,6 +346,9 @@
+ 
+ private:
+     void* arena_ = nullptr;          ///< the PinnedArena, owned
++    int map_fd_ = -1;                ///< rollout patch 0006: the mapped experts.bin (file-backed mode)
++    uint64_t map_bytes_ = 0;
++    bool file_backed_ = false;
+     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
+     uint64_t slice_bytes_ = 0;
+     const uint8_t* base_ = nullptr;
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1392,12 +1392,25 @@
+     strata::core::ArenaExpertSource arena_src;
+     strata::core::ExpertSource* srcp = nullptr;
+     if (o.mmap_experts) {
+-        if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
+-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+-            return 1;
++        // rollout patch 0006: a native (IQ) pack's experts.bin has per-layer strides, which FileExpertSource
++        // cannot read; the arena source in file-backed mode maps it directly (same layout, no pinned RAM).
++        if (strata::kernels::cpu::expert_layout().native) {
++            arena_src.set_gguf(o.native_preset);
++            arena_src.set_file_backed(true);
++            if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err)) {
++                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
++                return 1;
++            }
++            std::fprintf(stderr, "strata generate: experts via mmap of experts.bin (--mmap-experts; the IQ arm of R2.1, rollout patch 0006)\n");
++            srcp = &arena_src;
++        } else {
++            if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
++                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
++                return 1;
++            }
++            std::fprintf(stderr, "strata generate: experts via mmap (--mmap-experts; the A/B arm of R2.1)\n");
++            srcp = &src;
+         }
+-        std::fprintf(stderr, "strata generate: experts via mmap (--mmap-experts; the A/B arm of R2.1)\n");
+-        srcp = &src;
+     } else {
+         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
+         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err)) {
