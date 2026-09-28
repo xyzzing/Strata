@@ -1,0 +1,153 @@
+Portable HIP reference path for the QSA scorer (rollout patch 0001).
+Applied by scripts/rocm/hipify.sh after hipify-perl, to the generated
+tree only. Remove it and the file returns to the excluded list.
+Reason, semantics preserved, and what differs: see the comment block the
+patch inserts, and PORTING.md section 6b.
+--- a/src/kernels/cuda/native_qsa_score.cu
++++ b/src/kernels/cuda/native_qsa_score.cu
+@@ -29,26 +29,37 @@
+ namespace {
+ std::atomic<bool> enabled{false};
+ constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
+-struct TileA { uint32_t x[4]; };
+-struct TileB { uint32_t x[2]; };
+-struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };
+-__device__ __forceinline__ void load_a(TileA& a,const float* p) {
+-    const float* src=p+(threadIdx.x%16)*STRIDE+(threadIdx.x/16)*4;
+-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+-        : "=r"(a.x[0]),"=r"(a.x[1]),"=r"(a.x[2]),"=r"(a.x[3]):"l"(src));
++// ---------------------------------------------------------------------------
++// Portable HIP reference path - see scripts/rocm/patches/0001-*.patch.
++//
++// The CUDA original hands raw F32 register bits to
++// `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`, so each product is
++// formed from operands truncated to tf32 (10 explicit mantissa bits) and
++// accumulated in F32. AMD matrix intrinsics do not accept NVIDIA fragment
++// layouts, and the rollout plan requires a correct reference path before any
++// optimisation, so this computes the same quantity directly.
++//
++// Preserved deliberately: tf32 operand truncation, F32 accumulation, the
++// per-head ReLU, the ordered head addition, the optional F32 block bias, the
++// finite 1e9 F32 bias on the incomplete tail block, the reference's +0 bias on
++// full blocks, the write range [0, n_kv), the spare-row tolerance and the
++// invalid-count early exit.
++//
++// Differs deliberately, and stated rather than hidden: the reduction is one
++// sequential F32 sum over d, where the original splits d across two warps and
++// each tensor-core step sums an 8-wide slice internally. Bitwise agreement with
++// NVIDIA is therefore not claimed and is not required by the plan. The measured
++// deviation from a float64 reference is bounded and checked by
++// tests/rocm/qsa_score_parity.cpp.
++// ---------------------------------------------------------------------------
++
++// tf32 keeps the top 19 bits of an F32; the low 13 mantissa bits are what the
++// tensor core never sees when raw F32 registers are passed to it.
++__device__ __forceinline__ float strata_tf32_as_mma_sees_it(float x) {
++    return __uint_as_float(__float_as_uint(x) & 0xFFFFE000u);
+ }
+-__device__ __forceinline__ void load_b(TileB& b,const float* p) {
+-    const float* src=p+(threadIdx.x%8)*STRIDE+((threadIdx.x/8)*4)%8;
+-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0,%1}, [%2];"
+-        : "=r"(b.x[0]),"=r"(b.x[1]):"l"(src));
+-}
+-__device__ __forceinline__ void mma(TileC& c,const TileA& a,const TileB& b) {
+-    // Deliberately no cvt.rn.tf32: pinned mma.cuh passes raw F32 bits directly.
+-    asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+-        : "+f"(c.x[0]),"+f"(c.x[1]),"+f"(c.x[2]),"+f"(c.x[3])
+-        : "r"(a.x[0]),"r"(a.x[1]),"r"(a.x[2]),"r"(a.x[3]),"r"(b.x[0]),"r"(b.x[1]));
+-}
+-__global__ __launch_bounds__(64,1) void score_kernel(
++
++__global__ __launch_bounds__(WARPS * 32, 1) void score_kernel(
+         const float* __restrict__ pooled,const float* __restrict__ query,
+         const float* __restrict__ bias,const int32_t* __restrict__ step,
+         int max_cells,float* __restrict__ cells) {
+@@ -57,64 +68,38 @@
+        step[kStepWidth]!=(n<2051?n:2051))return;
+     const int row0=blockIdx.x*ROWS;
+     if(row0>full)return;
+-    const int lane=threadIdx.x,warp=threadIdx.y;
+-    __shared__ __align__(16) float shared[WARPS*16*STRIDE];
+-    float* tile=shared+warp*16*STRIDE;
+-    TileC c[2];
+-    // mmf's launch heuristic picks2warps for K128. Each warp accumulates
+-    // K[warp*32,warp*32+32), then K[warp*32+64,warp*32+96).
+-    for(int col=warp*32+lane;col<D;col+=WARPS*32){
+-        TileA a[2][4];
+-#pragma unroll
+-        for(int ia=0;ia<2;++ia){
+-            __syncwarp();
+-#pragma unroll
+-            for(int i=0;i<16;++i){
+-                const int row=row0+ia*16+i;
+-                tile[i*STRIDE+lane]=row<=full?pooled[size_t(row)*D+col]:0.0f;
+-            }
+-            __syncwarp();
+-#pragma unroll
+-            for(int k=0;k<4;++k)load_a(a[ia][k],tile+k*8);
++
++    // One sequential F32 dot product per (row, head); rows past `full` are the
++    // spare row and must not contribute.
++    __shared__ float dot[ROWS][HEADS];
++    const int tid=threadIdx.y*32+threadIdx.x;
++    for(int idx=tid;idx<ROWS*HEADS;idx+=WARPS*32){
++        const int r=idx/HEADS,h=idx%HEADS;
++        const int row=row0+r;
++        float acc=0.0f;
++        if(row<=full){
++            const float* p=pooled+size_t(row)*D;
++            const float* q=query+size_t(h)*D;
++#pragma unroll 4
++            for(int d=0;d<D;++d)
++                acc=__fadd_rn(acc,strata_tf32_as_mma_sees_it(p[d])*strata_tf32_as_mma_sees_it(q[d]));
+         }
+-        __syncwarp();
+-#pragma unroll
+-        for(int h=0;h<8;++h)tile[h*STRIDE+lane]=h<HEADS?query[h*D+col]:0.0f;
+-        __syncwarp();
+-#pragma unroll
+-        for(int k=0;k<4;++k){
+-            TileB b;load_b(b,tile+k*8);
+-#pragma unroll
+-            for(int ia=0;ia<2;++ia)mma(c[ia],a[ia][k],b);
+-        }
++        dot[r][h]=acc;
+     }
+     __syncthreads();
+-#pragma unroll
+-    for(int ia=0;ia<2;++ia){
+-#pragma unroll
+-        for(int l=0;l<4;++l){
+-            const int i=warp*ROWS+ia*16+(l/2)*8+lane/4;
+-            const int h=(lane%4)*2+l%2;
+-            shared[h*COMBINE+i]=c[ia].x[l];
+-        }
+-    }
+-    __syncthreads();
+-    // In the reference: +0 then warp0 partial then warp1 partial, followed
+-    // by materialized ReLU, CONT(head0), ADD(head1), ADD(head2), ADD(head3).
+-    if(warp==0){
+-        const int row=row0+lane;
+-        if(row>full)return;
++
++    // Same combine as the reference: ReLU per head, ordered F32 head addition,
++    // optional F32 block bias, then the finite 1e9 bias for the incomplete tail
++    // and the reference's materialized +0 for full blocks.
++    for(int r=tid;r<ROWS;r+=WARPS*32){
++        const int row=row0+r;
++        if(row>full)continue;
+         float h[HEADS];
+ #pragma unroll
+-        for(int j=0;j<HEADS;++j){
+-            float v=__fadd_rn(0.0f,shared[j*COMBINE+lane]);
+-            v=__fadd_rn(v,shared[j*COMBINE+ROWS+lane]);
+-            h[j]=fmaxf(v,0.0f);
+-        }
++        for(int j=0;j<HEADS;++j)h[j]=fmaxf(__fadd_rn(0.0f,dot[r][j]),0.0f);
+         float sum=__fadd_rn(__fadd_rn(__fadd_rn(h[0],h[1]),h[2]),h[3]);
+         if(bias)sum=__fadd_rn(sum,bias[row]);
+         sum=__fadd_rn(sum,row==full&&n%R?1e9f:0.0f);
+-        // The live causal mask is +0. Invalid/padded cells are never exported.
+         sum=__fadd_rn(sum,0.0f);
+         for(int i=row*R;i<n&&i<(row+1)*R;++i)cells[i]=sum;
+     }
