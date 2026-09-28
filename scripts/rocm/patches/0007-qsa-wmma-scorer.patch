@@ -1,0 +1,150 @@
+Rollout patch 0007: opt-in WMMA QSA scorer for gfx1100 (rocWMMA rocm-7.1.1).
+
+The portable scorer (patch 0001) is one sequential F32 dot per (row, head) -
+correct by construction, slow by design. This patch adds a second, OPT-IN arm:
+score_wmma_kernel, one wave32 per 16 pooled rows, computing the 128-deep dots
+with rocWMMA 16x16x16 fp16 fragments and f32 accumulation (gfx1100 native WMMA;
+vendored rocm-7.1.1 headers - v0.8 cannot compile mma_sync for gfx1100, measured,
+PORTING.md 12g). Inputs convert to fp16 round-to-nearest: the same 10-mantissa-bit
+loss the tf32 path simulates, with pooled/query magnitudes O(1) by construction
+(RMS-normalized rows times w_k_norm), far from fp16 range/subnormal edges. Rows
+past `full` are zero-filled before the fragment loads; the query heads are padded
+4 -> 16 in shared memory so the col_major fragment stays in bounds; the epilogue
+is the PORTABLE epilogue verbatim (per-head ReLU, ordered head sum, bias, 1e9
+tail, writes in [0,n)). Dispatch is a separate atomic (set_wmma), default OFF -
+the portable path remains the default and the reference. The error bound this arm
+must meet (fp16 conversion + order-agnostic f32 accumulation + shared epilogue)
+is derived BEFORE this kernel in PORTING.md 12g and asserted by
+tests/rocm/qsa_score_wmma_parity.cpp against a float64 oracle and a cross-check
+against the portable arm. Engine wiring is deliberately NOT part of this patch:
+native_qsa_score is test-only upstream, and the engine's fast-select path uses a
+different capacity (max_blocks = max_cells/4 + 2) and a separate spare-key buffer
+- wiring is a follow-up gated on the bench numbers.
+
+--- a/include/strata/kernels/native_qsa_score.hpp
++++ b/include/strata/kernels/native_qsa_score.hpp
+@@ -6,6 +6,11 @@
+ // Configure before capture; independent of native key pooling and norm/gate.
+ void native_qsa_score_set_enabled(bool enabled);
+ bool native_qsa_score_enabled();
++// Rollout patch 0007: opt-in WMMA scorer (gfx1100 wave32 via rocWMMA rocm-7.1.1).
++// Default OFF - the portable F32 path stays the reference. The WMMA bound is
++// derived in PORTING.md 12g and asserted by tests/rocm/qsa_score_wmma_parity.cpp.
++void native_qsa_score_set_wmma(bool wmma);
++bool native_qsa_score_wmma();
+ 
+ // SM120, single contiguous text sequence: F32 pooled[128,max_blocks] and
+ // query[128,4], four-cell blocks, top-k budget2048. Matches the pinned CUDA MMF
+--- a/src/kernels/cuda/native_qsa_score.cu
++++ b/src/kernels/cuda/native_qsa_score.cu
+@@ -25,9 +25,16 @@
+ #include <cstdint>
+ #include <stdexcept>
+ 
++// Rollout patch 0007: the WMMA arm. rocWMMA rocm-7.1.1 supports gfx1100 natively
++// (wave32-only on gfx11, matching this build; CMake pins CMAKE_HIP_ARCHITECTURES
++// to gfx1100 and refuses anything else, so an unconditional include is safe here).
++// v0.8 could NOT compile mma_sync for gfx1100 - measured, see PORTING.md 12g.
++#include <rocwmma/rocwmma.hpp>
++
+ namespace strata::kernels {
+ namespace {
+ std::atomic<bool> enabled{false};
++std::atomic<bool> wmma_enabled{false};   // rollout patch 0007: opt-in WMMA scorer
+ constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
+ // ---------------------------------------------------------------------------
+ // Portable HIP reference path - see scripts/rocm/patches/0001-*.patch.
+@@ -113,9 +120,76 @@
+     const auto x=reinterpret_cast<uintptr_t>(a.p),y=reinterpret_cast<uintptr_t>(b.p);
+     return x<y+b.n&&y<x+a.n;
+ }
++// ---- rollout patch 0007: the WMMA scorer (opt-in) ---------------------------
++// One wave32 per 16 pooled rows. A = those rows as fp16 (round-to-nearest, the
++// same 10-mantissa-bit loss the tf32 path simulates), staged to shared with rows
++// past `full` zeroed so the fragment always reads a full tile. B = the four query
++// heads as fp16 with the fragment's N dimension zero-padded 4 -> 16 (a col_major
++// fragment over the raw 512-float query buffer would read past its end). K=128
++// runs as 8 rocWMMA 16x16x16 tiles; the accumulator's columns 0..3 are the four
++// head dots. The epilogue is the PORTABLE epilogue, unchanged: per-head ReLU,
++// ORDERED head addition, optional bias, the finite 1e9 tail, cells written in
++// [0, n) only. The WMMA unit's internal accumulation order is unspecified; the
++// error bound that covers it is derived in PORTING.md 12g and asserted by
++// tests/rocm/qsa_score_wmma_parity.cpp.
++constexpr int WROWS = 16;    // pooled rows per WMMA tile (one wave32 each)
++constexpr int WLDDB = 136;   // B staging stride: 16 padded columns, 16-byte-aligned rows
++
++__global__ __launch_bounds__(32, 1) void score_wmma_kernel(
++    const float* __restrict__ pooled, const float* __restrict__ query,
++    const float* __restrict__ bias, const int32_t* __restrict__ step,
++    int max_cells, float* __restrict__ cells) {
++    const int n = step[kStepNKv], full = step[kStepNBid];
++    if(n<1||n>max_cells||step[kStepPos]!=n-1||full!=n/R||
++       step[kStepWidth]!=(n<2051?n:2051))return;
++    const int row0=blockIdx.x*WROWS;
++    if(row0>full)return;
++
++    __shared__ __align__(16) rocwmma::float16_t sA[WROWS][D];
++    __shared__ __align__(16) rocwmma::float16_t sB[16][WLDDB];
++    __shared__ __align__(16) float sC[WROWS][16];
++
++    const int t=threadIdx.x;
++    for(int i=t;i<WROWS*D;i+=32){
++        const int r=i/D,d=i%D;
++        const int row=row0+r;
++        sA[r][d]=row<=full?rocwmma::float16_t(pooled[(size_t)row*D+d]):rocwmma::float16_t(0.0f);
++    }
++    for(int i=t;i<16*WLDDB;i+=32){
++        const int h=i/WLDDB,k=i%WLDDB;
++        sB[h][k]=(h<HEADS&&k<D)?rocwmma::float16_t(query[(size_t)h*D+k]):rocwmma::float16_t(0.0f);
++    }
++    __syncthreads();
++
++    auto fragA=rocwmma::fragment<rocwmma::matrix_a,16,16,16,rocwmma::float16_t,rocwmma::row_major>();
++    auto fragB=rocwmma::fragment<rocwmma::matrix_b,16,16,16,rocwmma::float16_t,rocwmma::col_major>();
++    auto fragAcc=rocwmma::fragment<rocwmma::accumulator,16,16,16,rocwmma::float32_t>();
++    rocwmma::fill_fragment(fragAcc,0.0f);
++    for(int k0=0;k0<D;k0+=16){
++        rocwmma::load_matrix_sync(fragA,&sA[0][0]+k0,D);
++        rocwmma::load_matrix_sync(fragB,&sB[0][0]+k0,WLDDB);
++        rocwmma::mma_sync(fragAcc,fragA,fragB,fragAcc);
++    }
++    rocwmma::store_matrix_sync(&sC[0][0],fragAcc,16,rocwmma::mem_row_major);
++    __syncthreads();
++
++    for(int r=t;r<WROWS;r+=32){
++        const int row=row0+r;
++        if(row>full)continue;
++        float h[HEADS];
++        for(int j=0;j<HEADS;++j)h[j]=fmaxf(__fadd_rn(0.0f,sC[r][j]),0.0f);
++        float sum=__fadd_rn(__fadd_rn(__fadd_rn(h[0],h[1]),h[2]),h[3]);
++        if(bias)sum=__fadd_rn(sum,bias[row]);
++        sum=__fadd_rn(sum,row==full&&n%R?1e9f:0.0f);
++        sum=__fadd_rn(sum,0.0f);
++        for(int i=row*R;i<n&&i<(row+1)*R;++i)cells[i]=sum;
++    }
++}
+ } // namespace
+ void native_qsa_score_set_enabled(bool value){enabled.store(value,std::memory_order_relaxed);}
+ bool native_qsa_score_enabled(){return enabled.load(std::memory_order_relaxed);}
++void native_qsa_score_set_wmma(bool value){wmma_enabled.store(value,std::memory_order_relaxed);}
++bool native_qsa_score_wmma(){return wmma_enabled.load(std::memory_order_relaxed);}
+ void native_qsa_score(const float* pooled,const float* query,const float* bias,
+                       const QsaShapes& s,const int32_t* step,int64_t max_blocks,int64_t max_cells,
+                       float* cells,void* stream){
+@@ -128,8 +202,14 @@
+     for(int i=0;i<count;++i)validate(spans[i]);
+     for(int i=0;i<count;++i)for(int j=i+1;j<count;++j)
+         if(overlaps(spans[i],spans[j]))throw std::invalid_argument("native QSA score spans overlap");
+-    score_kernel<<<unsigned((max_blocks+ROWS-1)/ROWS),dim3(32,WARPS),0,static_cast<hipStream_t>(stream)>>>(
+-        pooled,query,bias,step,int(max_cells),cells);
++    if(wmma_enabled.load(std::memory_order_relaxed)){
++        // rollout patch 0007: opt-in WMMA arm. One wave32 per 16-row tile.
++        score_wmma_kernel<<<unsigned((max_blocks+WROWS-1)/WROWS),32,0,static_cast<hipStream_t>(stream)>>>(
++            pooled,query,bias,step,int(max_cells),cells);
++    }else{
++        score_kernel<<<unsigned((max_blocks+ROWS-1)/ROWS),dim3(32,WARPS),0,static_cast<hipStream_t>(stream)>>>(
++            pooled,query,bias,step,int(max_cells),cells);
++    }
+     const auto error=hipGetLastError();
+     if(error!=hipSuccess)throw std::runtime_error(hipGetErrorString(error));
+ }

@@ -1,0 +1,11 @@
+{
+  "tool": "hipify-perl",
+  "source": "https://raw.githubusercontent.com/ROCm/HIPIFY/5038c162dec23ffe39617d0ac07500d3014f791e/bin/hipify-perl",
+  "upstream": "https://github.com/ROCm/HIPIFY",
+  "commit": "5038c162dec23ffe39617d0ac07500d3014f791e",
+  "license": "MIT",
+  "bytes": 986704,
+  "sha256": "bd4fcfd286bcbd1511c2f8719e585ee417cddebd43927fd2906f75dfef8a8415",
+  "vendored_at": "20260928T071251Z",
+  "note": "Vendored so the translator is pinned by hash rather than by whatever a distro ships. Never edited by hand; re-run prepare --force to replace it."
+}

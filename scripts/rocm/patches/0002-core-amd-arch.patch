@@ -1,0 +1,71 @@
+AMD architecture gate for the runtime core (rollout patch 0002).
+Replaces the sm_120 compute-capability check with a validated-target list.
+Applied by scripts/rocm/hipify.sh after hipify-perl, to the generated tree
+only; Strata/src/core/device.cu keeps the upstream check. Rationale and the
+rule for widening the list: PORTING.md section 6d.
+--- a/include/strata/core/device.hpp
++++ b/include/strata/core/device.hpp
+@@ -22,6 +22,7 @@
+     int ordinal = -1;
+     std::string name;
+     int cc_major = 0, cc_minor = 0;
++    std::string arch;              // HIP: the GCN architecture string ("gfx1100"); empty on CUDA
+     uint64_t total_bytes = 0;      // as reported by cudaMemGetInfo at query time
+     uint64_t free_bytes = 0;
+     int driver_version = 0, runtime_version = 0;
+--- a/src/core/device.cu
++++ b/src/core/device.cu
+@@ -30,7 +30,8 @@
+     int count = 0;
+     check(hipGetDeviceCount(&count), "hipGetDeviceCount");
+     if (count == 0) {
+-        throw CudaError("no CUDA device is present; Strata targets sm_120 (RTX 5000 series)", -1);
++        throw CudaError("no HIP device is present (check access to /dev/kfd); this build is validated "
++                        "for gfx1100 (Radeon RX 7900 XTX)", -1);
+     }
+     if (ordinal < 0 || ordinal >= count) {
+         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
+@@ -56,13 +57,24 @@
+     check(hipDriverGetVersion(&d.driver_version), "hipDriverGetVersion");
+     check(hipRuntimeGetVersion(&d.runtime_version), "hipRuntimeGetVersion");
+ 
+-    // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
+-    // is caught here, because a binary can be carried to a machine with an older card and would otherwise
+-    // silently take whatever path the driver chose.
+-    if (d.cc_major != 12) {
+-        throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
+-                            "." + std::to_string(d.cc_minor) +
+-                            "; Strata targets sm_120 (RTX 5000 series / Blackwell) only",
++    // This port is validated on exactly one AMD target.  Compiling for an
++    // architecture is enforced by the build; RUNNING on something else is caught
++    // here, because a binary can be carried to a machine with a different card
++    // and would otherwise silently take whatever path the driver chose.
++    //
++    // The list below is a statement of what has actually been TESTED on this
++    // port, not of what a compiler accepted.  Widening it is a measured decision
++    // with a passing suite behind it - never a convenience, and never by
++    // relaxing the comparison into one that accepts everything.  The upstream
++    // sm_120 check still lives in Strata/src/core/device.cu; this replaces it
++    // only in this generated tree.
++    d.arch = p.gcnArchName;                       // "gfx1100" or "gfx1100:sramecc-:xnack-"
++    const bool arch_validated = d.arch.compare(0, 7, "gfx1100") == 0;
++    if (!arch_validated) {
++        throw CudaError("device " + d.name + " reports architecture " + d.arch +
++                            " (HIP capability " + std::to_string(d.cc_major) + "." +
++                            std::to_string(d.cc_minor) +
++                            "); this build is validated for gfx1100 (Radeon RX 7900 XTX) only",
+                         -1);
+     }
+     return d;
+--- a/src/core/device_main.cpp
++++ b/src/core/device_main.cpp
+@@ -33,7 +33,8 @@
+     try {
+         const strata::core::DeviceInfo d = strata::core::device_info(0);
+         ::printf("device %d: %s\n", d.ordinal, d.name.c_str());
+-        ::printf("  compute capability  %d.%d   (sm_%d%d)\n", d.cc_major, d.cc_minor, d.cc_major, d.cc_minor);
++        ::printf("  architecture        %s   (HIP capability %d.%d)\n", d.arch.c_str(), d.cc_major,
++                 d.cc_minor);
+         ::printf("  multiprocessors     %d\n", d.multi_processor_count);
+         ::printf("  VRAM total / free   %s / %s\n", human(d.total_bytes).c_str(), human(d.free_bytes).c_str());
+         ::printf("  driver / runtime    %d / %d\n", d.driver_version, d.runtime_version);
