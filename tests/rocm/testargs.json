@@ -1,0 +1,15 @@
+{
+  "_comment": "How each test binary is invoked. The default is --selftest; a test that takes a positional argument instead declares its own argv here. Without this, the runner's blanket --selftest would be read as a filename (native_expert_parity did exactly that and aborted).",
+  "tests": {
+    "native_expert_parity": {
+      "argv": [],
+      "note": "argv[1] is a GGUF shard path. With no arguments it prints usage and exits 2, which is the honest 'missing input' signature declared in unavailable.json."
+    },
+    "iq_parity": {
+      "argv": [
+        "${ROCM_ROOT}/artifacts/rocm/iq_fixture"
+      ],
+      "note": "argv[1] is the fixture directory. Nothing else in the suite takes an argument."
+    }
+  }
+}
