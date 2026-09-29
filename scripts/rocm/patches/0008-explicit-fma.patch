@@ -1,0 +1,261 @@
+Rollout patch 0008: the explicit-fma campaign (PORTING 14 backlog item 1).
+
+The build compiles -ffp-contract=off for bit-parity (7); that also costs every
+kernel its fused multiply-adds - nvcc contracts a*b+c for free and we do not.
+This patch introduces EXPLICIT __fmaf_rn at the hot per-token sites so the
+fused instruction is emitted regardless of the flag, with every touched kernel
+gated by its existing parity test (bound/tolerance gates are fusion-tolerant
+by construction; the one bit-pinned test flips its reference to the fused
+model in the same patch, keeping its fused!=unfused sensitivity check).
+
+Sites: s2_gemv_q8 (4, the engine S2 path), bf16_gemv (3 kernels x their MAC),
+native_rope (the + rotation form; a*c - b*s has no fma form and stays),
+native_gdn (kv shard dot, rank-1 update, readout), gdn canonical (both 128-iter
+passes + 4-tap conv; fp64 norm loops stay unfused - RDNA3 fp64 fma is not a
+win), native_flash_attn (QK dot x2, softmax rescale), native_mmvq epilogues
+(q5_k/q4_k dual chains, q2_0/q6_k chains; dp4a bodies are integer-immune),
+elementwise embedding_gather (+ its parity reference flip).
+
+Semantics: __fmaf_rn(a, b, 0) == the rn multiply, so no-offset paths are
+bit-identical; everywhere else the result is the CORRECTLY-ROUNDED product-sum
+where the old code double-rounded - a tighter arithmetic, not a looser one.
+
+--- a/src/kernels/cuda/elementwise.cu
++++ b/src/kernels/cuda/elementwise.cu
+@@ -26,8 +26,8 @@
+     const unsigned mask = (1u << code_bits) - 1u;
+     const int code = (codes[i / per_byte] >> ((i % per_byte) * code_bits)) & mask;
+     const int64_t group = i / group_elems;
+-    const float product = __fmul_rn((float) (code + code_bias), scales[group]);
+-    out[i] = __fadd_rn(product, offsets ? offsets[group] : 0.0f);
++    out[i] = __fmaf_rn((float) (code + code_bias), scales[group],
++                       offsets ? offsets[group] : 0.0f);
+ }
+ 
+ /// `ggml_compute_softplus_f32`: `log1p(exp(x))`, with the large-x branch that avoids overflow.
+--- a/src/kernels/cuda/s2_gemv_q8.cu
++++ b/src/kernels/cuda/s2_gemv_q8.cu
+@@ -58,10 +58,10 @@
+         const float w1 = (float) ((int) ((byte >> 2) & 3) - 1) * d;
+         const float w2 = (float) ((int) ((byte >> 4) & 3) - 1) * d;
+         const float w3 = (float) ((int) ((byte >> 6) & 3) - 1) * d;
+-        a0 += w0 * ((float) xq[off + 0] * dx);
+-        a1 += w1 * ((float) xq[off + 1] * dx);
+-        a2 += w2 * ((float) xq[off + 2] * dx);
+-        a3 += w3 * ((float) xq[off + 3] * dx);
++        a0 = __fmaf_rn(w0, (float) xq[off + 0] * dx, a0);
++        a1 = __fmaf_rn(w1, (float) xq[off + 1] * dx, a1);
++        a2 = __fmaf_rn(w2, (float) xq[off + 2] * dx, a2);
++        a3 = __fmaf_rn(w3, (float) xq[off + 3] * dx, a3);
+     }
+     partial[tid] = (a0 + a1) + (a2 + a3);
+     __syncthreads();
+--- a/src/kernels/cuda/bf16_gemv.cu
++++ b/src/kernels/cuda/bf16_gemv.cu
+@@ -22,7 +22,7 @@
+     const uint16_t* row = w + o * n_in;
+     float acc = 0.0f;
+     for (long long i = 0; i < n_in; ++i)
+-        acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
++        acc = __fmaf_rn(f32_from_bf16(x[i]), f32_from_bf16(row[i]), acc);
+     y[o] = acc;
+ }
+ 
+@@ -38,7 +38,7 @@
+     const uint16_t* row = w + o * n_in;
+     float acc = 0.0f;
+     for (long long i = lane; i < n_in; i += 32)
+-        acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
++        acc = __fmaf_rn(f32_from_bf16(x[i]), f32_from_bf16(row[i]), acc);
+     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFull, acc, off);
+     if (lane == 0) y[o] = acc;
+ }
+@@ -54,7 +54,7 @@
+     const uint16_t* row = w + o * n_in;
+     float acc = 0.0f;
+     for (long long i = t; i < n_in; i += tpr)
+-        acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
++        acc = __fmaf_rn(f32_from_bf16(x[i]), f32_from_bf16(row[i]), acc);
+     // block reduction; `tpr` is at most a few hundred, so a tree in shared is enough
+     scratch[t] = acc;
+     __syncthreads();
+--- a/src/kernels/cuda/native_rope.cu
++++ b/src/kernels/cuda/native_rope.cu
+@@ -55,7 +55,7 @@
+     const float c = cosf(theta), s = sinf(theta);
+     const float a = x[start + pair], b = x[start + pair + n_rot / 2];
+     out[start + pair] = a * c - b * s;
+-    out[start + pair + n_rot / 2] = a * s + b * c;
++    out[start + pair + n_rot / 2] = __fmaf_rn(a, s, b * c);   // rollout patch 0008: the + form fuses; a*c - b*s has no fma form
+ }
+ }
+ namespace { std::atomic<const int32_t*> mrope_tab{nullptr}; }
+--- a/src/kernels/cuda/native_gdn.cu
++++ b/src/kernels/cuda/native_gdn.cu
+@@ -62,14 +62,14 @@
+     const float g_val = expf(gate[head]);
+     float kv_shard = 0.0f;
+ #pragma unroll
+-    for (int r = 0; r < 4; ++r) kv_shard += s_shard[r] * k_reg[r];
++    for (int r = 0; r < 4; ++r) kv_shard = __fmaf_rn(s_shard[r], k_reg[r], kv_shard);
+     const float kv_col = warp_sum(kv_shard);
+     const float delta_col = (v[head * S + col] - g_val * kv_col) * beta[head];
+     float attn_partial = 0.0f;
+ #pragma unroll
+     for (int r = 0; r < 4; ++r) {
+-        s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col;
+-        attn_partial += s_shard[r] * q_reg[r];
++        s_shard[r] = __fmaf_rn(k_reg[r], delta_col, __fmul_rn(g_val, s_shard[r]));
++        attn_partial = __fmaf_rn(s_shard[r], q_reg[r], attn_partial);
+     }
+     const float attn_col = warp_sum(attn_partial);
+     if (lane == 0) output[head * S + col] = attn_col * scale;
+--- a/src/kernels/cuda/gdn.cu
++++ b/src/kernels/cuda/gdn.cu
+@@ -80,15 +80,15 @@
+         for (int i = 0; i < S; ++i) {
+             const float s = col[(size_t) i * stride] * dec;
+             col[(size_t) i * stride] = s;
+-            sk += s * ks[hi][i];
++            sk = __fmaf_rn(s, ks[hi][i], sk);
+         }
+         const float d = (v[(size_t) h * S + j] - sk) * b;
+         // pass 2: the rank-1 update, then read out against q using the UPDATED state
+         float dot = 0.0f;
+         for (int i = 0; i < S; ++i) {
+-            const float s = col[(size_t) i * stride] + ks[hi][i] * d;
++            const float s = __fmaf_rn(ks[hi][i], d, col[(size_t) i * stride]);
+             col[(size_t) i * stride] = s;
+-            dot += s * qs[hi][i];
++            dot = __fmaf_rn(s, qs[hi][i], dot);
+         }
+         o[(size_t) h * S + j] = dot;
+     }
+@@ -103,8 +103,8 @@
+     float* st = cs + (size_t) c * (dc - 1);
+     const float* w = kW + (size_t) c * dc;
+     float acc = 0.0f;
+-    for (int i = 0; i < dc - 1; ++i) acc += st[i] * w[i];   // kernel[0] reads the OLDEST state row
+-    acc += x[c] * w[dc - 1];                                // the new input lands in the LAST tap
++    for (int i = 0; i < dc - 1; ++i) acc = __fmaf_rn(st[i], w[i], acc);   // kernel[0] reads the OLDEST state row
++    acc = __fmaf_rn(x[c], w[dc - 1], acc);                                // the new input lands in the LAST tap
+     out[c] = acc;
+     for (int i = 0; i < dc - 2; ++i) st[i] = st[i + 1];     // slide: drop the oldest, append the newest
+     st[dc - 2] = x[c];
+--- a/src/kernels/cuda/native_flash_attn.cu
++++ b/src/kernels/cuda/native_flash_attn.cu
+@@ -92,8 +92,8 @@
+                     const int d = 2 * (i + j);
+                     const float a = cell < width ? __half2float(k[(cell * 2 + kv) * 256 + d]) : 0.0f;
+                     const float b = cell < width ? __half2float(k[(cell * 2 + kv) * 256 + d + 1]) : 0.0f;
+-                    dot += a * qreg[i0 / 8 + j].x;
+-                    dot += b * qreg[i0 / 8 + j].y;
++                    dot = __fmaf_rn(a, qreg[i0 / 8 + j].x, dot);
++                    dot = __fmaf_rn(b, qreg[i0 / 8 + j].y, dot);
+                 }
+             }
+             dot = warp_sum<8>(dot);
+@@ -107,7 +107,7 @@
+         const float rescale = expf(maximum - next_max);
+         maximum = next_max;
+         score = expf(score - maximum);
+-        sum = sum * rescale + score;
++        sum = __fmaf_rn(sum, rescale, score);
+         tile[tid] = score;
+         __syncwarp();
+ #pragma unroll
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -167,8 +167,8 @@
+         const int v1i = vl1i | vh1i;
+         const int dot1 = __dp4a(v0i, u[2 * i], __dp4a(v1i, u[2 * i + 1], 0));
+         const int dot2 = __dp4a(0x01010101, u[2 * i], __dp4a(0x01010101, u[2 * i + 1], 0));
+-        sumf_d += d8[i] * (dot1 * sc[i]);
+-        sumf_m += d8[i] * (dot2 * m[i]);
++        sumf_d = __fmaf_rn(d8[i], dot1 * sc[i], sumf_d);
++        sumf_m = __fmaf_rn(d8[i], dot2 * m[i], sumf_m);
+     }
+     const float2 dm5f = __half22float2(dm5);
+     return dm5f.x * sumf_d - dm5f.y * sumf_m;
+@@ -348,7 +348,7 @@
+         const int vil = (vl >> (2 * i)) & 0x03030303;
+         const int vih = ((vh >> i) << 2) & 0x04040404;
+         const int vi = __vsubss4(vil, vih);
+-        sumf += d8[i] * (__dp4a(vi, u[i], 0) * sc);
++        sumf = __fmaf_rn(d8[i], __dp4a(vi, u[i], 0) * sc, sumf);
+     }
+     return d3 * sumf;
+ }
+@@ -503,8 +503,8 @@
+         const int v1i = (v[1] >> (4 * i)) & 0x0f0f0f0f;
+         const int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i], 0));
+         const int dot2 = __dp4a(0x01010101, u[2 * i + 1], __dp4a(0x01010101, u[2 * i], 0));
+-        sumf_d += d8[i] * (dot1 * sc[i]);
+-        sumf_m += d8[i] * (dot2 * m[i]);
++        sumf_d = __fmaf_rn(d8[i], dot1 * sc[i], sumf_d);
++        sumf_m = __fmaf_rn(d8[i], dot2 * m[i], sumf_m);
+     }
+     const float2 dm4f = __half22float2(dm4);
+     return dm4f.x * sumf_d - dm4f.y * sumf_m;
+@@ -599,7 +599,7 @@
+         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+         const int vi = __vsubss4(vil | vih, 0x20202020);
+-        sumf += d8[i] * (__dp4a(vi, u[i], 0) * sc);
++        sumf = __fmaf_rn(d8[i], __dp4a(vi, u[i], 0) * sc, sumf);
+     }
+     return d * sumf;
+ }
+--- a/src/kernels/elementwise_parity.cpp
++++ b/src/kernels/elementwise_parity.cpp
+@@ -354,11 +354,15 @@
+                             for (int i = 0; i < n; ++i) {
+                                 const size_t gi = (size_t) row * row_groups + i / group;
+                                 const float code = (float) (unpacked[(size_t) row * n + i] + bias);
+-                                volatile float product = code * scales[gi];
+                                 const float offset = with_offset ? offsets[gi] : 0.0f;
+-                                want[(size_t) i] = product + offset;
+-                                const float fused = std::fma(code, scales[gi], offset);
+-                                if (std::memcmp(&fused, &want[(size_t) i], sizeof(float)) != 0) ++fma_diff;
++                                // rollout patch 0008: the kernel now fuses (__fmaf_rn), so the
++                                // reference is the FUSED model; the unfused volatile product stays
++                                // as the fixture-sensitivity check (fused != unfused must be
++                                // common, or bit-equality with the fused reference proves nothing).
++                                volatile float unfused_prod = code * scales[gi];
++                                const float unfused = unfused_prod + offset;
++                                want[(size_t) i] = std::fma(code, scales[gi], offset);
++                                if (std::memcmp(&want[(size_t) i], &unfused, sizeof(float)) != 0) ++fma_diff;
+                             }
+                             check(hipMemcpyAsync(out, got.data(), got.size() * sizeof(float), hipMemcpyHostToDevice, stream), "embedding output guards");
+                             strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
+
+Batch F (session 6): the prompt-path prefill kernels complete the coverage.
+--- a/src/prefill/kernels.cu
++++ b/src/prefill/kernels.cu
+@@ -62,7 +62,7 @@
+     const int c = (int) (row % HC);
+     const float* r = R + row * N;
+     float ss = 0.0f;
+-    for (int d = threadIdx.x; d < N; d += blockDim.x) ss += r[d] * r[d];
++    for (int d = threadIdx.x; d < N; d += blockDim.x) ss = __fmaf_rn(r[d], r[d], ss);
+     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+     for (int d = threadIdx.x; d < N; d += blockDim.x) {
+         const float v = r[d] * rs * w[c * N + d];
+@@ -126,7 +126,7 @@
+     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+     for (int64_t t = 0; t < T; ++t) {
+         const float x = qkv[t * C + c];
+-        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
++        const float s = __fmaf_rn(v2, w2, __fmaf_rn(v1, w1, __fmaf_rn(v0, w0, x * w3)));
+         h[t * C + c] = s / (1.0f + __expf(-s));
+         v0 = v1; v1 = v2; v2 = x;
+     }
+@@ -306,7 +306,7 @@
+     __shared__ float sh[32];
+     float* r = x + (int64_t) blockIdx.x * ld;
+     float ss = 0.0f;
+-    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) ss += r[c] * r[c];
++    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) ss = __fmaf_rn(r[c], r[c], ss);
+     const float s = rsqrtf(block_sum(ss, sh) / (float) cols + eps);
+     __syncthreads();
+     for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) r[c] = s * r[c] * w[c];
