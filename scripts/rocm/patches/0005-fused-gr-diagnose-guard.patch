@@ -1,0 +1,39 @@
+Rollout patch 0005: make fused_gr_read_multi run on gfx1100 and diagnose its guard.
+1. TILE 2560 -> 1024: the multi-token down projection staged 8*2560*4 = 80 KB of dynamic
+   shared memory, past the 64 KB workgroup LDS limit on RDNA3 (upstream targets RTX, where
+   80 KB fits). hipFuncSetAttribute failed silently and the launch returned
+   hipErrorInvalidValue, which killed the first prompt pass. 1024 divides D for the same
+   tile count arithmetic; only the chunk count grows. No tolerance or math change.
+2. The two argument-guard messages now print their values.
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -178,7 +178,10 @@
+     for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
+ }
+ 
+-constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
++constexpr int TILE = 1024;  // rollout patch 0005: was 2560; 8 tokens * 2560 floats * 4 B = 80 KB of
++                            // dynamic LDS, past gfx1100's 64 KB workgroup limit (RTX cards allow it).
++                            // 1024 -> 32 KB; the tile loop below is exact for any TILE dividing D, so
++                            // the arithmetic is unchanged - only the chunk count grows (4 -> 10).             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
+ constexpr int TQ = TILE / 8 / 32;      // uint4 weight chunks per lane per tile
+ 
+ // Step 2 of `gr_down_kernel` for T tokens.  One warp per row (so each lane accumulates the same chunks in the
+@@ -297,7 +300,7 @@
+ 
+ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream) {
+     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
+-        std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
++        std::fprintf(stderr, "fused_gr_read_multi: invalid arguments (n_tok=%d max=%d xn_scratch=%p)\n", n_tok, kFusedGrMaxT, (void*) xn_scratch);
+         std::exit(1);
+     }
+     GrMulti m;
+@@ -307,7 +310,7 @@
+         if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
+             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
+             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
+-            std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
++            std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d (R=%p w_norm=%p lo=%p rs=%p mixed=%p apply=%d)\n", t, (void*) x.R, (void*) x.w_norm, (void*) x.lo, (void*) x.rs, (void*) x.mixed, (int) x.apply);
+             std::exit(1);
+         }
+     }

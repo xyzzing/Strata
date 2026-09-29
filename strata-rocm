@@ -1,0 +1,51 @@
+#!/bin/sh
+# strata-rocm - one entry point for every repeatable operation in the
+# Strata ROCm rollout. Dispatch only; the work lives in scripts/rocm/.
+#
+#   ./strata-rocm doctor            read-only diagnostics, ready/blocked/unverified
+#   ./strata-rocm prepare           idempotent local setup (never touches system packages)
+#   ./strata-rocm build [target]    configure + build HIP for the detected target
+#   ./strata-rocm test --stage X    independent kernel / model tests
+#   ./strata-rocm bench             bounded benchmark with recorded settings
+#   ./strata-rocm status            stage, revision, pass/fail/skip, next action
+#   ./strata-rocm report            redacted Markdown + machine-readable result
+#   ./strata-rocm run               launch the validated config on loopback
+#
+# Extra commands used during conversion: hipify, smoke, fixtures.
+#
+# Environment overrides: STRATA_DIR, ART_DIR, BUILD_DIR.
+
+set -u
+
+ROCM_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export ROCM_ROOT
+. "$ROCM_ROOT/scripts/rocm/lib/common.sh"
+
+usage() {
+    # 2..first blank line: exactly the comment header, never live code.
+    sed -n '2,/^$/p' "$ROCM_ROOT/strata-rocm" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+[ $# -ge 1 ] || usage 1
+cmd=$1
+shift
+
+case "$cmd" in
+    doctor|prepare|build|test|bench|status|report|run|hipify|smoke|fixtures|selftest|tune)
+        script="$SCRIPTS_DIR/$cmd.sh"
+        [ -f "$script" ] || die "not implemented yet: $cmd ($script)"
+        exec sh "$script" "$@"
+        ;;
+    -h|--help|help)
+        usage 0
+        ;;
+    --version)
+        printf 'strata-rocm (rollout wrapper) rev %s\n' "$(strata_revision)"
+        exit 0
+        ;;
+    *)
+        warn "unknown command: $cmd"
+        usage 1
+        ;;
+esac
