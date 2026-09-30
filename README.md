@@ -30,6 +30,7 @@ Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
 | **IQ3_XXS** | 62 tokens/s | 49 tokens/s | 1,750 tokens/s |
 | **IQ3_S** | 53 tokens/s | 46 tokens/s | 1,620 tokens/s |
 | **Coder** (IQ1_M) | 55 tokens/s | 43 tokens/s | 2,180 tokens/s |
+| **IQ3_S** (AMD RX 7900 XTX) | 52 tokens/s | 52 tokens/s | 602 tokens/s |
 
 - **Writes answers** = how fast the reply appears (tokens per second).
 - **Reads your prompt** = how fast it takes in what you send (long documents, code, chat history), measured on a

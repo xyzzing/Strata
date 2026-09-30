@@ -26,6 +26,7 @@ measured with Swift 1.5's IQ2_XS, which runs at the original's speed.
 | **IQ3_XXS** | 482 | 1,007 | 1,745 | 1,609 | 1,602 | - |
 | **IQ3_S** | 427 | 913 | 1,624 | 1,640 | 1,443 | - |
 | **Coder** | 656 | 1,583 | 2,177 | 2,236 | 2,208 | 1,034** |
+| **IQ3_S** (AMD RX 7900 XTX, gfx1100) | 860 | 1,350 | 602 | 1,449 | 1,403 | - |
 
 Engine 0.1.26; `bench/results/2026-09-29-speed-0126`. At 32K-128K that is 8-28% faster than 0.1.22. † not measured
 again: 0.1.22. \* measured with images on (the image encoder's VRAM reserve leaves fewer experts cached). \*\* not
@@ -40,6 +41,7 @@ measured again: 0.1.14.
 | **IQ3_XXS** | 61.9 | 61.6 | 58.5 | 57.2 | 49.0 | - |
 | **IQ3_S** | 52.4 | 53.3 | 48.3 | 46.3 | 45.5 | - |
 | **Coder** | 58.9 | 55.1 | 54.9 | 53.2 | 43.0 | 42.8† |
+| **IQ3_S** (AMD RX 7900 XTX, gfx1100) | 51.3 | 52.2 | 50.1 | 44.9 | 52.1 | - |
 
 Engine 0.1.26, the same runs. † not measured again: 0.1.14.
 
