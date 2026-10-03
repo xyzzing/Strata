@@ -511,7 +511,7 @@ __global__ void __launch_bounds__(256) f32_to_f16_poison_kernel(const float* __r
         out[i] = __float2half(i < n ? in[i] : 60000.0f);   // poisoned slack must never reach a score
 }
 
-__global__ void __launch_bounds__(32) block_scores_wmma_kernel(const __half* __restrict__ pooled16,
+__global__ void __launch_bounds__(32) block_scores_wmma_gfx11_kernel(const __half* __restrict__ pooled16,
                                                                const __half* __restrict__ q16,
                                                                const int32_t* __restrict__ steps, int nq,
                                                                int64_t max_blocks, float* __restrict__ out) {
@@ -1096,7 +1096,7 @@ bool qsa_block_scores_wmma(const float* pooled, const float* dead, const float* 
     };
     conv(pooled, (size_t) reach * IDX_DIM, scratch[dev], kb);
     conv(q_idx, (size_t) nq * IDX_HEADS * IDX_DIM, scratch[dev] + kb, qb);
-    block_scores_wmma_kernel<<<dim3((unsigned) ((reach + WM_BT - 1) / WM_BT), (unsigned) ((nq + 3) / 4)), 32, 0,
+    block_scores_wmma_gfx11_kernel<<<dim3((unsigned) ((reach + WM_BT - 1) / WM_BT), (unsigned) ((nq + 3) / 4)), 32, 0,
                                (cudaStream_t) stream>>>(scratch[dev], scratch[dev] + kb, steps, (int) nq, max_blocks,
                                                         scores);
     block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
