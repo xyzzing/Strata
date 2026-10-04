@@ -17,6 +17,12 @@ of a word): faster than you can read.
 > [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
 > [All the details](docs/DETAILS.md)
 
+> **This fork adds AMD:** a working HIP port for RDNA3 (gfx1100 — Radeon RX 7900 XT/XTX/GRE) with a
+> parity-tested kernel suite and measured serving of Qwen3.8-Flash-Next IQ3_S — decode 57–64 tok/s
+> from 1K to 128K context, prefill up to ~1.9K tok/s @128K with the opt-in tensor-core arms.
+> Numbers, flags and evidence: **[GFX1100.md](GFX1100.md)** · port thread
+> [Niko1221/Strata#106](https://github.com/Niko1221/Strata/issues/106)
+
 ---
 
 ## How fast is it?
@@ -219,3 +225,21 @@ Strata is open source under the [MIT License](LICENSE). A few parts carry their 
 (MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
 vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
 models are not part of this repository; each model's own license applies to its files.
+
+---
+
+## AMD gfx1100 (RDNA3) HIP port (this fork)
+
+Upstream Strata ships NVIDIA CUDA. This fork maintains a HIP port for AMD RDNA3 (gfx1100): a
+reproducible CUDA→HIP pipeline with a declared patch table, a kernel suite verified on the card
+against independent references (all ten IQ quantization formats bit-exact), and measured production
+serving on a single Radeon RX 7900 XTX (24 GB).
+
+Highlights — decode 56.8–64.2 tok/s across 1K–128K context (flat; GDN attention is O(1)); prefill
+1,403 tok/s @128K baseline, 1,687 with the gfx1100 hipBLASLt table (**+82%**), 1,863 with the
+opt-in RDNA3 prompt-attention WMMA arm (**+22.8%**). Every claim traces to a recorded measurement,
+and the knobs that did not win are recorded too.
+
+Opt-in flags, methodology, the rejected-with-records list and the evidence trail:
+**[GFX1100.md](GFX1100.md)**.
+
