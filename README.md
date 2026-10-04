@@ -233,3 +233,38 @@ and the knobs that did not win are recorded too.
 Opt-in flags, methodology, the rejected-with-records list and the evidence trail:
 **[GFX1100.md](GFX1100.md)**.
 
+## Using this fork on an RX 7900 XTX
+
+Linux with the `amdgpu` driver (no system ROCm needed), a C++ compiler and git, 64 GB of RAM and
+about 60 GB of disk:
+
+```sh
+git clone https://github.com/xyzzing/Strata && cd Strata
+./setup.sh --backend hip
+```
+
+Setup finds the card (gfx1100), installs ROCm 7 into `.venv` from AMD's TheRock wheels when no system
+ROCm is present (~10 GB, no sudo), compiles the engine for the card (10–20 minutes, once), downloads
+the model and writes a start script. Full details: [docs/AMD_HIP.md](docs/AMD_HIP.md).
+
+The opt-in switches this fork measures ([GFX1100.md](GFX1100.md) carries the numbers and evidence):
+
+| what | how | measured |
+| --- | --- | --- |
+| faster decode | `--spec 3` with `--spec-min-p 0.70`, and `STRATA_GR_V3=1` | +9.5% / +2.8% |
+| faster prefill | `STRATA_HIP_WMMA=1`, `STRATA_SELECT_WMMA=1` | +22.8% / +8.7% @128K |
+| tuned dense prefill | a hipBLASLt table matching your hipBLASLt version engages on its own | up to +82% @128K |
+
+Two things to know before you compare numbers. The +82% table targets hipBLASLt 1.5.0 (ROCm 10.2
+nightly) and is open as [PR #755](https://github.com/Niko1221/Strata/pull/755); on any other
+hipBLASLt version setup says so and the prompts run on plain hipBLAS — slower, same answers. And
+on-device autotuning of the decode kernels (per-GPU shapes, draft and CPU settings) is open as
+[PR #744](https://github.com/Niko1221/Strata/pull/744)
+([its doc](https://github.com/xyzzing/Strata/blob/hip-decode-autotune/docs/AMD_HIP_AUTOTUNE.md)) —
+it is not in this fork's main yet; it lands once it is rebased onto the current line and measured.
+
+What to expect: decode 57–64 tok/s from 1K to 128K context, prefill ~1.4K → ~1.9K tok/s @128K as
+the switches go on — warm-state (a cold serve climbs ~35% to these values as the page cache warms).
+One machine so far: a datapoint, not a benchmark.
+
+
