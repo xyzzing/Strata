@@ -258,10 +258,14 @@ The opt-in switches this fork measures ([GFX1100.md](GFX1100.md) carries the num
 Two things to know before you compare numbers. The +82% table targets hipBLASLt 1.5.0 (ROCm 10.2
 nightly) and is open as [PR #755](https://github.com/Niko1221/Strata/pull/755); on any other
 hipBLASLt version setup says so and the prompts run on plain hipBLAS — slower, same answers. And
-on-device autotuning of the decode kernels (per-GPU shapes, draft and CPU settings) is open as
-[PR #744](https://github.com/Niko1221/Strata/pull/744)
-([its doc](https://github.com/xyzzing/Strata/blob/hip-decode-autotune/docs/AMD_HIP_AUTOTUNE.md)) —
-it is not in this fork's main yet; it lands once it is rebased onto the current line and measured.
+on-device autotuning is **in this fork** (ported from upstream
+[PR #744](https://github.com/Niko1221/Strata/pull/744), its
+[doc](docs/AMD_HIP_AUTOTUNE.md) included): with the server stopped,
+`python tools/hip/autotune.py strata-<model>.json` times the decode kernels' block shapes on *your*
+card — every candidate is checked byte for byte against the default before it may be timed, and a
+tuning table is written only if it wins twice and the generated tokens are identical
+(`--settings` adds the draft floor and CPU workers, `--off` reverts). On this machine, at this
+model's shapes, the defaults already win — the tuner's own verdict; your card may differ.
 
 What to expect: decode 57–64 tok/s from 1K to 128K context, prefill ~1.4K → ~1.9K tok/s @128K as
 the switches go on — warm-state (a cold serve climbs ~35% to these values as the page cache warms).
