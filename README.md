@@ -18,6 +18,12 @@ and coding agents. Nothing leaves your PC.
 > from 1K to 128K context, prefill up to ~1.9K tok/s @128K with the opt-in tensor-core arms. Numbers, flags and
 > evidence: **[GFX1100.md](GFX1100.md)** · port thread
 > [Niko1221/Strata#106](https://github.com/Niko1221/Strata/issues/106)
+>
+> **How this was made:** the port, its verification campaigns and these docs were produced by an AI engineering
+> agent powered by **GLM-5.3 (Z.ai)** working under [xyzzing](https://github.com/xyzzing)'s direction — every
+> number traces to a recorded measurement on this machine. The measured model is Qwen3.8-Flash-Next, served as
+> the local resident with its MTP draft layer as the speculative-decoding drafter (full credits in
+> [GFX1100.md](GFX1100.md)).
 
 ## How fast is it?
 
