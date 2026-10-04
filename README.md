@@ -13,6 +13,12 @@ Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Nex
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.
 
+> **This fork adds RDNA3:** a working HIP port for gfx1100 (Radeon RX 7900 XT/XTX/GRE) — the AMD numbers above
+> are RDNA4 (RX 9070 XT); here the same engine is parity-tested and measured on a 7900 XTX: decode 57–64 tok/s
+> from 1K to 128K context, prefill up to ~1.9K tok/s @128K with the opt-in tensor-core arms. Numbers, flags and
+> evidence: **[GFX1100.md](GFX1100.md)** · port thread
+> [Niko1221/Strata#106](https://github.com/Niko1221/Strata/issues/106)
+
 ## How fast is it?
 
 We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
@@ -209,3 +215,21 @@ parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md
 Strata is free and open source. If it is useful to you, you can support its development:
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+
+---
+
+## RDNA3 / gfx1100 port status (this fork)
+
+Upstream's AMD numbers above are RDNA4 (RX 9070 XT, gfx1201). This fork maintains and measures the
+RDNA3 (gfx1100) path on a Radeon RX 7900 XTX (24 GB): a reproducible CUDA→HIP pipeline with a
+declared patch table, a kernel suite verified on the card against independent references (all ten
+IQ quantization formats bit-exact), and measured production serving of Qwen3.8-Flash-Next IQ3_S.
+
+Highlights — decode 56.8–64.2 tok/s across 1K–128K context (flat; GDN attention is O(1)); prefill
+1,403 tok/s @128K baseline, 1,687 with the gfx1100 hipBLASLt table (**+82%**), 1,863 with the
+opt-in RDNA3 prompt-attention WMMA arm (**+22.8%**). Every claim traces to a recorded measurement,
+and the knobs that did not win are recorded too.
+
+Opt-in flags, methodology, the rejected-with-records list and the evidence trail:
+**[GFX1100.md](GFX1100.md)**.
+
