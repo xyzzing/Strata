@@ -135,11 +135,16 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__
             if (t >= w) continue;
             if (s2 > t) { A[p] = 0.0f; continue; }
             if (s2 == t) { A[p] = 1.0f; continue; }
-            const float b = beta[(t0 + t) * HV + head], g = __expf(gate[(t0 + t) * HV + head]);
+            const float b = beta[(t0 + t) * HV + head];
             float dk = 0.0f;
 #pragma unroll 4
             for (int i = 0; i < S; ++i) dk += kt[t][i] * kt[s2][i];
-            A[p] = b * g * (dec[t] / dec[s2 + 1]) * dk;
+            // the decay factor as a product, not g * dec[t]/dec[s+1]: fp32 cumulative products underflow to 0
+            // under fast decay and the ratio becomes 0/0 = NaN (the serial path multiplies and lands at 0).
+            // g * (dec[t]/dec[s+1]) = prod of gates s+1..t exactly - the standalone g is consumed.
+            float dec_ratio = 1.0f;
+            for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
+            A[p] = b * dec_ratio * dk;
         }
         __syncthreads();
         float uj[WY], pk[WY], pq[WY];
@@ -174,14 +179,20 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__
                 float dq = 0.0f;
 #pragma unroll 4
                 for (int i = 0; i < S; ++i) dq += qt[i] * kt[s2][i];
-                o += (dec[t + 1] / dec[s2 + 1]) * dq * uj[s2];
+                float dec_ratio = 1.0f;
+                for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
+                o += dec_ratio * dq * uj[s2];
             }
             if (rg == 0) oc_out[(t0 + t) * HV * S + head * S + col] = o * rsqrtf((float) S);
         }
         for (int r = 0; r < RPG; ++r) {
             const int i = rg * RPG + r;
             float v = dec[w] * s[r];
-            for (int s2 = 0; s2 < w; ++s2) v += (dec[w] / dec[s2 + 1]) * kt[s2][i] * uj[s2];
+            for (int s2 = 0; s2 < w; ++s2) {
+                float dec_ratio = 1.0f;
+                for (int j = s2 + 1; j < w; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
+                v += dec_ratio * kt[s2][i] * uj[s2];
+            }
             s[r] = v;
         }
         __syncthreads();
@@ -287,6 +298,40 @@ void wy64(const double* h, const double* gate, const double* beta, const double*
         for (int j = 0; j < S; ++j) stT[(size_t) i * HV * S + j] = s[i * S + j];
 }
 
+// fp64 oracle over ALL heads, in the device's layout: oc[t*HV*S + head*S + j], state[(i*HV + head)*S + j].
+// The reference the device WY kernel is BOUND against (the serial-vs-WY host check above proves the chunk
+// algebra; this one quantifies the fp32 device's distance from exact).
+void oracle64(const double* h, const double* gate, const double* beta, const double* st0, double* oc, double* stT,
+              int64_t T) {
+    std::vector<double> s(S * S);
+    for (int head = 0; head < HV; ++head) {
+        const int qh = head % HK;
+        for (int i = 0; i < S; ++i)
+            for (int j = 0; j < S; ++j) s[i * S + j] = st0[((size_t) i * HV + head) * S + j];
+        for (int64_t t = 0; t < T; ++t) {
+            const double* kt = h + HK * S + t * C + qh * S;
+            const double* qt = h + t * C + qh * S;
+            const double* vt = h + 2 * HK * S + t * C + head * S;
+            const double g = std::exp(gate[t * HV + head]), b = beta[t * HV + head];
+            double delta[S];
+            for (int j = 0; j < S; ++j) {
+                double kv = 0;
+                for (int i = 0; i < S; ++i) kv += s[i * S + j] * kt[i];
+                delta[j] = (vt[j] - g * kv) * b;
+            }
+            for (int i = 0; i < S; ++i)
+                for (int j = 0; j < S; ++j) s[i * S + j] = g * s[i * S + j] + kt[i] * delta[j];
+            for (int j = 0; j < S; ++j) {
+                double o = 0;
+                for (int i = 0; i < S; ++i) o += s[i * S + j] * qt[i];
+                oc[((size_t) t * HV + head) * S + j] = o * (1.0 / std::sqrt((double) S));
+            }
+        }
+        for (int i = 0; i < S; ++i)
+            for (int j = 0; j < S; ++j) stT[((size_t) i * HV + head) * S + j] = s[i * S + j];
+    }
+}
+
 // ---------------------------------------------------------- fixtures
 int fixture(const char* name, int64_t T, int gates_mode, unsigned seed) {
     std::mt19937 rng(seed);
@@ -343,12 +388,13 @@ int main(int argc, char** argv) {
     (void) bench;
     int fails = 0;
     if (!bench) {
-        const int64_t Ts[] = {1, 64};
-        const int gm[] = {1};
+        const int64_t Ts[] = {1, 64, 4099};
+        const int gm[] = {0, 1, 2, 3};
         int wfails = 0;
-        double worst = 0.0;
+        double worst = 0.0, worst_oracle = 0.0;
         for (int64_t T : Ts)
             for (int g : gm) {
+                if (T == 4099 && g != 0) continue;   // one long device cell: the fp64 oracle is slow
                 std::mt19937 rng((unsigned) (T * 100 + g + 7));
                 std::normal_distribution<double> nd(0.0, 1.0);
                 std::uniform_real_distribution<double> ud(0.0, 1.0);
@@ -395,7 +441,7 @@ int main(int argc, char** argv) {
                 ck(cudaMemcpy(ocB.data(), dOB, oz * 4, cudaMemcpyDeviceToHost), "d4");
                 cudaFree(dH); cudaFree(dG); cudaFree(dB); cudaFree(dS0); cudaFree(dSA); cudaFree(dSB);
                 cudaFree(dOA); cudaFree(dOB);
-                double eoc = 0, est = 0, soc = 0;
+                double eoc = 0, est = 0, soc = 0, sost = 0;
                 for (size_t i = 0; i < oz; ++i) {
                     const double d = (double) std::fabs(ocA[i] - ocB[i]);
                     if (std::isnan(d) || d > eoc) eoc = d;   // std::max silently DROPS NaN - a NaN state
@@ -404,6 +450,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < st0.size(); ++i) {
                     const double d = (double) std::fabs(stA[i] - stB[i]);
                     if (std::isnan(d) || d > est) est = d;
+                    sost = std::max(sost, (double) std::fabs(stA[i]));
                 }
                 // TEMP diagnostics: locate the first non-finite entry in each array (t, head, col)
                 for (int which = 0; which < 4; ++which) {
@@ -437,15 +484,48 @@ int main(int argc, char** argv) {
                                     st0[(size_t) 2 * HV * S + j], st0[(size_t) 3 * HV * S + j],
                                     ocA[(size_t) j], ocB[(size_t) j], stA[(size_t) j], stB[(size_t) j]);
                     }
-                const double bound = 1e-3 * (1.0 + soc);
-                const bool ok = eoc < bound && est < 1.0;
+                const double bound = 1e-3 * (1.0 + soc), bst = 1e-3 * (1.0 + sost);
+                const bool ok = eoc < bound && est < bst;   // scale-aware (the state grows without decay)
                 worst = std::max(worst, eoc);
                 if (!ok) {
                     ++wfails;
                     std::printf("  WY gpu T=%d g=%d: oc err %.3e (bound %.3e) state err %.3e FAIL\n", (int) T, g, eoc, bound, est);
                 }
+                // WY3: the device fp32 WY kernel against the fp64 oracle, inside the derived reassociation
+                // bound.  Per element the device sums <= ~2^10 fp32 terms (S + WY dots + the substitution
+                // chain) at u32 = 2^-24 each, compounded over ceil(T/WY) serial sub-chunks: the bound is
+                // (T/WY + 1) * 2^10 * 2^-24 * (1 + scale) = (T/WY + 1) * 2^-14 * (1 + scale), scale from the
+                // oracle itself.  No tolerance is involved: B is derived, and the negative control is the
+                // serial-vs-WY check above (a same-arithmetic pairing must stay ~1e-7 here).
+                {
+                    std::vector<double> h64(h.begin(), h.end()), g64(gate.begin(), gate.end()), b64(beta.begin(), beta.end()),
+                        s064(st0.begin(), st0.end()), ocO(oz), stO(st0.size());
+                    oracle64(h64.data(), g64.data(), b64.data(), s064.data(), ocO.data(), stO.data(), T);
+                    double eo_oc = 0, eo_st = 0, so_oc = 0, so_st = 0;
+                    for (size_t i = 0; i < oz; ++i) {
+                        const double d = std::fabs((double) ocB[i] - ocO[i]);
+                        if (std::isnan(d) || d > eo_oc) eo_oc = d;
+                        so_oc = std::max(so_oc, std::fabs(ocO[i]));
+                    }
+                    for (size_t i = 0; i < st0.size(); ++i) {
+                        const double d = std::fabs((double) stB[i] - stO[i]);
+                        if (std::isnan(d) || d > eo_st) eo_st = d;
+                        so_st = std::max(so_st, std::fabs(stO[i]));
+                    }
+                    const double chunks = (double) ((T + WY - 1) / WY);
+                    const double boc = chunks * (1.0 / 16384.0) * (1.0 + so_oc), bst = chunks * (1.0 / 16384.0) * (1.0 + so_st);
+                    const double util = std::max(eo_oc / boc, eo_st / bst);
+                    worst_oracle = std::max(worst_oracle, util);
+                    if (!(eo_oc < boc && eo_st < bst)) {
+                        ++wfails;
+                        std::printf("  WY oracle T=%d g=%d: oc %.3e (bound %.3e) state %.3e (bound %.3e) FAIL\n",
+                                    (int) T, g, eo_oc, boc, eo_st, bst);
+                    }
+                }
             }
         std::printf("device WY vs serial GPU: worst oc err %.3e -> %s\n", worst, wfails ? "FAIL" : "OK");
+        std::printf("device WY vs fp64 oracle: worst bound utilisation %.1f%% -> %s\n", worst_oracle * 100.0,
+                    wfails ? "FAIL" : "OK");
         fails += wfails;
     }
     fails += fixture("T=2 trace", 2, 0, 11);
