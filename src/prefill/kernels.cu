@@ -12,6 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 
+// the rocWMMA include for the GDN WY WMMA arm - at GLOBAL scope (its std:: names must not
+// resolve against the anonymous namespace below); see gdn_rec_wy_wmma_rocwmma.hpp
+#include "gdn_rec_wy_wmma_rocwmma.hpp"
+
 namespace strata::prefill {
 namespace {
 
@@ -700,6 +704,12 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
+// The tensor-core folds variant of the WY kernel (rocWMMA 16x16x16 fp16xfp16->f32, wave32),
+// included INSIDE the anonymous namespace so it sees S/HK/HV/C/CB/RG/RPG/NCB/WY above; the
+// revised checkpoint (tasks/gdn-wy-design-20261005.md §9 / wy-gdn-design-20261005.md §9) and
+// its pre-derived fp16-class bound predate this file. QA note: the codegen draft's `sh` alias
+// was block-scoped; hoisted to kernel scope at the LDS declarations during review.
+#include "gdn_rec_wy_wmma.cuh"
 // the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
 // norm stays in its scratch buffer)
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
@@ -1023,8 +1033,17 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
             gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
 #endif
-        if (wy)   // the chunk-parallel WY recurrence (opt-in; exact modulo summation order only - see the kernel comment)
-            gdn_rec_wy_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        if (wy) {   // the chunk-parallel WY recurrence (opt-in; wmma folds per the revised checkpoint, fma fallback)
+            if (gdn_wy_wmma_supported()) {
+                static const bool said_wmma = [] { std::fprintf(stderr, "gdn wy arm = wmma (gfx1100, opt-in)\n"); return true; }();
+                (void) said_wmma;
+                gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            } else {
+                static const bool said_fma = [] { std::fprintf(stderr, "gdn wy arm = fma (opt-in, wmma unavailable)\n"); return true; }();
+                (void) said_fma;
+                gdn_rec_wy_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            }
+        }
         else if (pipe)   // the software-pipelined loads (same bits)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
