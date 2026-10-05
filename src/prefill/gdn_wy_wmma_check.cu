@@ -317,6 +317,48 @@ int main(int argc, char** argv) {
     (void) argc;
     (void) argv;
 
+
+    // --bench: kernel-level timing of the wmma arm (compare with gdn_wy_check --bench's
+    // cols/pipe/wy-fp32 numbers at the same T). Always-decay inputs: outside the fp16 domain
+    // (random-sign growth) the arithmetic would run on infs and the timing would lie.
+    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+        for (int64_t T : {8192, 32768}) {
+            std::vector<float> h_f, gate_f, beta_f;
+            std::vector<double> h_d, gate_d, beta_d, st0_d;
+            generate_inputs(T, 4, 77, h_f, gate_f, beta_f, h_d, gate_d, beta_d, st0_d);
+            float *d_h, *d_gate, *d_beta, *d_state, *d_oc;
+            ck(hipMalloc(&d_h, h_f.size() * 4), "bm h");
+            ck(hipMalloc(&d_gate, gate_f.size() * 4), "bm g");
+            ck(hipMalloc(&d_beta, beta_f.size() * 4), "bm b");
+            ck(hipMalloc(&d_state, st0_d.size() * 4), "bm s");
+            ck(hipMalloc(&d_oc, (size_t) T * HV * S * 4), "bm o");
+            ck(hipMemcpy(d_h, h_f.data(), h_f.size() * 4, hipMemcpyHostToDevice), "bm mh");
+            ck(hipMemcpy(d_gate, gate_f.data(), gate_f.size() * 4, hipMemcpyHostToDevice), "bm mg");
+            ck(hipMemcpy(d_beta, beta_f.data(), beta_f.size() * 4, hipMemcpyHostToDevice), "bm mb");
+            ck(hipMemset(d_state, 0, st0_d.size() * 4), "bm ms0");
+            hipEvent_t e0, e1;
+            ck(hipEventCreate(&e0), "bm ev"); ck(hipEventCreate(&e1), "bm ev");
+            const int warm = 3, reps = T <= 8192 ? 10 : 5;
+            for (int i = 0; i < warm; ++i)
+                gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG)>>>(d_state, d_h, d_gate, d_beta, d_oc, T);
+            ck(hipDeviceSynchronize(), "bm warm");
+            float best = 1e30f;
+            for (int i = 0; i < reps; ++i) {
+                ck(hipEventRecord(e0), "bm r");
+                gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG)>>>(d_state, d_h, d_gate, d_beta, d_oc, T);
+                ck(hipEventRecord(e1), "bm r");
+                ck(hipEventSynchronize(e1), "bm r");
+                float ms = 0;
+                ck(hipEventElapsedTime(&ms, e0, e1), "bm r");
+                best = best < ms ? best : ms;
+            }
+            std::printf("gdn wy wmma bench T=%lld: %.1f ms (best of %d)\n", (long long) T, best, reps);
+            ck(hipEventDestroy(e0), "bm ev"); ck(hipEventDestroy(e1), "bm ev");
+            hipFree(d_h); hipFree(d_gate); hipFree(d_beta); hipFree(d_state); hipFree(d_oc);
+        }
+        return 0;
+    }
+
     if (!gdn_wy_wmma_supported()) {
         std::printf("gdn_wy_wmma_check: SKIP (rocwmma unavailable or not gfx1100)\n");
         return 0;
