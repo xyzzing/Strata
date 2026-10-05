@@ -20,7 +20,21 @@ if(STRATA_ENABLE_SYCL)
   add_subdirectory(sycl)
   return()
 endif()
-add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+set(STRATA_VERSION_FULL "${PROJECT_VERSION}")
+# the binary names its tree state: a production rebuild once silently lacked branch-only
+# content and nothing recorded which tree the binary came from (this fork's sessions; a
+# `strata --version` that says "0.1.39 (c81936d)" ends that class). Upstream-neutral: the
+# plain version when git is absent or describe fails.
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --exclude "*"
+                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                  OUTPUT_VARIABLE _strata_git_describe OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(_strata_git_describe)
+    string(APPEND STRATA_VERSION_FULL "-${_strata_git_describe}")
+  endif()
+endif()
+add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_FULL}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
