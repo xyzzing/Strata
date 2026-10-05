@@ -239,33 +239,38 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_wy_wmma_kernel(
 
         // Site 5: P GEMM (WY x WY, K=S)
         // Warp assignment: 4 warps, each handles 16 rows of P (M dim).
-        // Overlay qt16 with P16. qt16 is dead after Site 3.
+        // Overlay qt16 with P16. qt16 is dead after Site 3 - BUT the mma loads read the whole
+        // qt16 row (ld=S) every nt iteration, so ALL K-loops must finish before ANY P16 store
+        // lands: K outer, nt inner, one accumulator fragment per nt tile (the per-nt-then-K
+        // order self-clobbered a_frag with freshly stored P16 rows - the T=1 oracle FAIL class).
         {
             int warpId = tid >> 5;
             int row_start = warpId * 16;
-            
+
+            rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc[WY / 16];
             #pragma unroll
-            for (int nt = 0; nt < WY / 16; ++nt) {
-                rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc;
-                rocwmma::fill_fragment(acc, 0.0f);
-                
+            for (int nt = 0; nt < WY / 16; ++nt) rocwmma::fill_fragment(acc[nt], 0.0f);
+
+            #pragma unroll
+            for (int ks = 0; ks < S / 16; ++ks) {
+                rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::row_major> a_frag;
+                rocwmma::load_matrix_sync(a_frag, &qt16[row_start][ks * 16], S);
                 #pragma unroll
-                for (int ks = 0; ks < S / 16; ++ks) {
-                    rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::row_major> a_frag;
+                for (int nt = 0; nt < WY / 16; ++nt) {
                     // F7: col_major is correct for kt16-transposed trick here
                     rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::col_major> b_frag;
-                    
-                    rocwmma::load_matrix_sync(a_frag, &qt16[row_start][ks * 16], S);
                     rocwmma::load_matrix_sync(b_frag, &kt16[nt * 16][ks * 16], S);
-                    
-                    rocwmma::mma_sync(acc, a_frag, b_frag, acc);
+                    rocwmma::mma_sync(acc[nt], a_frag, b_frag, acc[nt]);
                 }
-                
-                // Store to qt16 (reused as P16). rocWMMA 7.1.1 has no converting store, so the
-                // f32 fragment lands in a warp-private 16x16 region of the dead pk32 scratch
-                // and is hand-converted into the fp16 tile (same row-major layout, ld=S).
+            }
+
+            // Store P16: rocWMMA 7.1.1 has no converting store, so each f32 fragment lands in
+            // a warp-private 16x16 region of the dead pk32 scratch and is hand-converted into
+            // the fp16 tile (same row-major layout, ld=S).
+            #pragma unroll
+            for (int nt = 0; nt < WY / 16; ++nt) {
                 __syncthreads();   // scratch free (previous nt) + everyone past the mma loads
-                rocwmma::store_matrix_sync(&pf[warpId * 256], acc, 16, rocwmma::mem_row_major);
+                rocwmma::store_matrix_sync(&pf[warpId * 256], acc[nt], 16, rocwmma::mem_row_major);
                 __syncthreads();
                 for (int i = (tid & 31); i < 256; i += 32)   // this warp's own 16x16 scratch region
                     qt16[row_start + i / 16][nt * 16 + i % 16] = __float2half_rn(pf[warpId * 256 + i]);
@@ -346,35 +351,37 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_wy_wmma_kernel(
         __syncthreads();
 
         // State GEMM (S x CB, K=WY)
-        // Warp assignment: 4 warps, each handles 32 rows of State (M dim).
+        // Warp assignment: 4 warps x TWO 16-row M-tiles each = all 128 state rows
+        // (a single 16-row tile per warp covered only half the state - the oracle caught it).
         // Matrix A is kt16^T (S x WY). Matrix B is U16 (WY x CB).
         {
             int warpId = tid >> 5;
             int row_start = warpId * 32; // 4 warps * 32 rows = 128 rows
-            
+
             #pragma unroll
             for (int nt = 0; nt < CB / 16; ++nt) {
-                rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc;
-                rocwmma::fill_fragment(acc, 0.0f);
-                
+                rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float> acc[2];
+                rocwmma::fill_fragment(acc[0], 0.0f);
+                rocwmma::fill_fragment(acc[1], 0.0f);
+
                 #pragma unroll
                 for (int ks = 0; ks < WY / 16; ++ks) {
+                    // F7: matrix_b row_major for U16; matrix_a col_major = the kt16^T view
                     rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, __half, rocwmma::col_major> a_frag;
-                    // F7: matrix_b row_major for U16
                     rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, __half, rocwmma::row_major> b_frag;
-                    
-                    // A is kt16^T. kt16 is [WY][S].
-                    // We want A[k][s2] = kt16[s2][k].
-                    // Col_major load from kt16 with ld=S gives A[k][s2] = kt16[s2][k].
+
+                    // A[m][k] = kt16[ks*16 + k][row_start + m] (col_major, ld=S)
                     rocwmma::load_matrix_sync(a_frag, &kt16[ks * 16][row_start], S);
                     rocwmma::load_matrix_sync(b_frag, &U16[ks * 16][nt * 16], CB);
-                    
-                    rocwmma::mma_sync(acc, a_frag, b_frag, acc);
+                    rocwmma::mma_sync(acc[0], a_frag, b_frag, acc[0]);
+                    rocwmma::load_matrix_sync(a_frag, &kt16[ks * 16][row_start + 16], S);
+                    rocwmma::mma_sync(acc[1], a_frag, b_frag, acc[1]);
                 }
-                
+
                 // F12: Store S_out into A's storage (o32 is dead after the oc write)
                 // A's storage holds: o32 [WY][CB] then S_out [S][CB] - both fit, barrier-separated
-                rocwmma::store_matrix_sync(&A[row_start * CB + nt * 16], acc, CB, rocwmma::mem_row_major);
+                rocwmma::store_matrix_sync(&A[row_start * CB + nt * 16], acc[0], CB, rocwmma::mem_row_major);
+                rocwmma::store_matrix_sync(&A[(row_start + 16) * CB + nt * 16], acc[1], CB, rocwmma::mem_row_major);
             }
         }
         __syncthreads();
