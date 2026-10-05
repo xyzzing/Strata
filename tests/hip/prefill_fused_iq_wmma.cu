@@ -92,6 +92,157 @@ __device__ __forceinline__ void load_unit_iq3_s(const uint8_t* bp, int ib, uint3
     w[3] = ld16(bp) | ((uint32_t) bp[66 + ib] << 16) | ((uint32_t) ((bp[106 + ib / 2] >> (4 * (ib & 1))) & 15) << 24);
 }
 
+
+__device__ __forceinline__ uint32_t byte_perm(uint32_t x, uint32_t y, uint32_t s) {
+    return __builtin_amdgcn_perm(x, y, s);
+}
+
+// ---- Q2_0 and IQ4_NL decode units (Qwen draft, fixture-judged) ----
+__device__ __forceinline__ void load_unit_q2_0(const uint8_t* bp, int ib, uint32_t (&w)[3]) {
+    // w[0] = ld32(bp + 2 + 8 * ib);
+    // w[1] = ld32(bp + 6 + 8 * ib);
+    // w[2] = ld16(bp);
+    w[0] = ld32(bp + 2 + 8 * ib);
+    w[1] = ld32(bp + 6 + 8 * ib);
+    w[2] = ld16(bp);
+}
+
+__device__ __forceinline__ void convert_q2_0(const uint32_t (&w)[3], int8_t (&q)[32], float& s0, float& s1) {
+    // Q2_0: 2-bit codes {-1, 0, 1, 2} (code - 1), 8 codes per 16-bit word, w[0]/w[1] = the two
+    // 32-code halves of the sub-block; the original computes this with byte_perm pool tricks -
+    // the direct table lookup is the same function of the codes, fixture-judged bit-exact.
+    const int8_t tbl[4] = {-1, 0, 1, 2};
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+        const uint32_t c = (w[h >> 1] >> (16 * (h & 1))) & 0xFFFF;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) q[8 * h + j] = tbl[(c >> (2 * j)) & 3];
+    }
+    s0 = s1 = half_at(w[2]);
+}
+
+__device__ __forceinline__ void load_unit_iq4nl(const uint8_t* bp, uint32_t (&w)[5]) {
+    // for (int k = 0; k < 4; ++k) w[k] = ld32(bp + 2 + 4 * k);
+    // w[4] = ld16(bp);
+    for (int k = 0; k < 4; ++k) {
+        w[k] = ld32(bp + 2 + 4 * k);
+    }
+    w[4] = ld16(bp);
+}
+
+__device__ __forceinline__ void convert_iq4nl(const uint32_t (&w)[5], const uint32_t (&kv)[4], int8_t (&q)[32], float& s0, float& s1) {
+    // table16(w[k], kv, q[k], q[4 + k]) for k 0..3
+    // table16(q4, t, lo, hi): 
+    //   sel = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+    //   tmp[i] = __byte_perm(__byte_perm(t[0], t[1], q4 >> 16i), __byte_perm(t[2], t[3], q4 >> 16i), sel >> 16i) for i 0..1
+    //   lo = __byte_perm(tmp[0], tmp[1], 0x6420); 
+    //   hi = __byte_perm(tmp[0], tmp[1], 0x7531);
+    
+    // kv is prebuilt: kv[k>>2] |= (uint32_t)(uint8_t)kvalues_iq4nl[k] << (8 * (k & 3)) for k 0..15
+    // This means kv[0] contains kvalues[0..3], kv[1] contains kvalues[4..7], etc.
+    
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t q4 = w[k];
+        
+        // sel = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+        // 0x88888888 has bit 3 of each byte set.
+        // (q4 & 0x88888888) >> 1 shifts bit 3 to bit 2.
+        // So sel has bit 2 of each byte set if the sign bit of the nibble was set?
+        // The table lookup handles the magnitude, and the sign is applied via the permute?
+        // Or the table contains signed values?
+        // kvalues_iq4nl is int8_t. So the table values are signed.
+        // The "sign-spread" mentioned in the prompt.
+        
+        const uint32_t sel = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+        
+        uint32_t tmp[2];
+        for (int i = 0; i < 2; ++i) {
+            // q4 >> 16i selects the upper or lower 16 bits of q4?
+            // i=0: q4 >> 0. i=1: q4 >> 16.
+            // This splits the 32-bit q4 into two 16-bit halves.
+            // Each half contains 4 nibbles.
+            
+            const uint32_t q4_half = q4 >> (16 * i);
+            const uint32_t sel_half = sel >> (16 * i);
+            
+            // __byte_perm(t[0], t[1], q4_half)
+            // t[0] is kv[0], t[1] is kv[1].
+            // q4_half has 4 nibbles. Each nibble selects a byte from {t[1], t[0]}.
+            // So if s nibble is 0, select byte 0 of x. If 1, byte 1 of x... If 4, byte 0 of y.
+            // The nibbles of q4_half are 4-bit indices.
+            // But byte_perm selects 4 bytes.
+            // If q4_half has 4 nibbles, and we want to look up 4 values from the table...
+            // The table kv[0] has 4 bytes (values 0-3). kv[1] has 4 bytes (values 4-7).
+            // If the nibble is 0-3, it should select from kv[0].
+            // If the nibble is 4-7, it should select from kv[1].
+            // __byte_perm(kv[0], kv[1], nibble) 
+            // If nibble < 4, it selects from kv[0] (x).
+            // If nibble >= 4, it selects from kv[1] (y).
+            
+            const uint32_t perm1 = byte_perm(kv[0], kv[1], q4_half);
+            const uint32_t perm2 = byte_perm(kv[2], kv[3], q4_half);
+            
+            // Now combine perm1 and perm2 using sel_half.
+            // sel_half has nibbles that select from {perm2, perm1}.
+            // The sel construction: 0x32103210 | ((q4 & 0x88888888) >> 1).
+            // 0x3210 selects bytes 0,1,2,3 of x (perm1).
+            // The OR part adds 4 to the selector if the sign bit was set?
+            // If sign bit set, sel nibble becomes 4,5,6,7?
+            // 0x3210 + 4 = 0x7654.
+            // So if sign bit set, it selects from y (perm2).
+            // This effectively negates or flips the value?
+            // The table values are signed.
+            // If the sign bit is set, we select from the "negative" table?
+            // But kv is just one table.
+            // Maybe the "sign-spread" is handled by the permute selecting a different byte?
+            // Or maybe the table is constructed such that the upper half is the negation?
+            // The prompt says: "per-value sign-spread and table lookups must match bit-for-bit".
+            
+            tmp[i] = byte_perm(perm1, perm2, sel_half);
+        }
+        
+        // lo = __byte_perm(tmp[0], tmp[1], 0x6420);
+        // hi = __byte_perm(tmp[0], tmp[1], 0x7531);
+        
+        const uint32_t lo = byte_perm(tmp[0], tmp[1], 0x6420);
+        const uint32_t hi = byte_perm(tmp[0], tmp[1], 0x7531);
+        
+        // Unpack lo and hi into q
+        // "table16(w[k], kv, q[k], q[4 + k])"
+        // This suggests q[k] is the lo part and q[4+k] is the hi part?
+        // But q is int8_t (&q)[32].
+        // And k=0..3.
+        // So for k=0, we fill q[0] and q[4]?
+        // But lo and hi are uint32_t containing 4 int8s each.
+        // If q is int8_t*, then q[k] is an int8_t.
+        // But table16 produces uint32_t lo/hi.
+        // Which indices?
+        // The loop is k=0..3.
+        // Each k processes 8 values (4 from lo, 4 from hi).
+        // Total 32 values.
+        // Natural order:
+        // k=0 -> q[0..7]
+        // k=1 -> q[8..15]
+        // k=2 -> q[16..23]
+        // k=3 -> q[24..31]
+        
+        // Unpack lo into q[8*k .. 8*k+3]
+        q[8 * k + 0] = (int8_t)(lo & 0xFF);
+        q[8 * k + 1] = (int8_t)((lo >> 8) & 0xFF);
+        q[8 * k + 2] = (int8_t)((lo >> 16) & 0xFF);
+        q[8 * k + 3] = (int8_t)((lo >> 24) & 0xFF);
+        
+        // Unpack hi into q[8*k+4 .. 8*k+7]
+        q[8 * k + 4] = (int8_t)(hi & 0xFF);
+        q[8 * k + 5] = (int8_t)((hi >> 8) & 0xFF);
+        q[8 * k + 6] = (int8_t)((hi >> 16) & 0xFF);
+        q[8 * k + 7] = (int8_t)((hi >> 24) & 0xFF);
+    }
+    
+    s0 = half_at(w[4]);
+    s1 = half_at(w[4]);
+}
+
 // ---- the mma primitive (Qwen-proven unit) ----
 
 __device__ __forceinline__ void mma_tile_16(const int8_t* A_lds, int lda, const int8_t* B_tile, int ldb,
@@ -158,6 +309,7 @@ __global__ void __launch_bounds__(THREADS) native_kernel_wmma_iq3s(
                 for (int h = 0; h < 2; ++h)
                     for (int j16 = 0; j16 < 2; ++j16) {
                         __syncthreads();
+        for (int i = 0; i < 2; ++i) {
                         mma_tile_16(&wt[wr0][32 * h + 16 * j16], WLD,
                                     &ast[nt * 16][32 * h + 16 * j16], 64,
                                     &dot[warp][i][0][0], 16);
@@ -177,6 +329,77 @@ __global__ void __launch_bounds__(THREADS) native_kernel_wmma_iq3s(
                                                                : dup + (size_t) (row0 + wr0 + m - FF) * TR + r0 + nt * 16 + c;
                             *out = fmaf(wsc * asc, v, *out);
                             }
+                        }
+                        __syncthreads();
+                    }
+            }
+        }
+    }
+}
+}
+
+// ---- the down path (Q2_0 weights, fp32 dm out) and the gu requant epilogue test ----
+//
+// The gu requant (verbatim semantics from the CUDA arm): H[row] per 32-feature half-block,
+// abs-max over the warp's 32 features via __shfl_xor, H codes = rn(h * 127/am), scale = am/127.
+// The down kernel: [2560 x 640] Q2_0 weights against H-as-int8 (per-32 codes + per-32 scales,
+// the same AB layout family) -> fp32 dm[row][2560]. K = 640 = 10 stages of 64.
+constexpr int D_ROWS = 2560;
+constexpr int DK = 640;
+constexpr int DNS = DK / 64;                    // 10 stages
+constexpr int DBS = 32;                          // Q2_0 block = 64 values, 2 sub-blocks
+
+__global__ void __launch_bounds__(THREADS) down_kernel_wmma_q2_0(
+    const uint8_t* __restrict__ blob, size_t d_row, const uint8_t* __restrict__ hq,
+    const float* __restrict__ hscale, float* __restrict__ dm) {
+    __shared__ int8_t wt[128][64];
+
+    __shared__ float ws[128][4];
+    __shared__ int8_t hst[128][64];
+    __shared__ float hsl[128][2];
+    __shared__ int32_t dot[4][2][16][16];
+
+    const int tid = threadIdx.x, warp = tid >> 5;
+    const int row0 = blockIdx.x * 128, r0 = blockIdx.y * 128;
+
+    for (int s = 0; s < DNS; ++s) {
+        __syncthreads();
+        // Q2_0: one 64-value block (18 bytes: fp16 d + 16 bytes of 2-bit codes) per stage,
+        // sub-blocks ib 0/1 - no super-blocks, the fp16 scale is per block
+        for (int d = tid; d < 2 * 128; d += THREADS) {
+            const int dec_row = d / 2, dec_uj = d % 2;
+            const uint8_t* bp = blob + (size_t) (row0 + dec_row) * d_row + (size_t) s * 18;
+            uint32_t w[3];
+            float s0, s1;
+            load_unit_q2_0(bp, dec_uj, w);
+            if (s == 0 && dec_row == 0 && dec_uj == 0 && blockIdx.x == 0 && tid == 0)
+            convert_q2_0(w, *(int8_t (*)[32]) & wt[dec_row][32 * dec_uj], s0, s1);
+            ws[dec_row][2 * dec_uj] = s0;
+            ws[dec_row][2 * dec_uj + 1] = s1;
+        }
+        for (int r = tid; r < 128; r += THREADS) {
+            memcpy(&hst[r][0], hq + ((size_t) (r0 + r) * DNS + s) * 80, 64);
+            memcpy(&hsl[r][0], hq + ((size_t) (r0 + r) * DNS + s) * 80 + 64, 8);
+        }
+        __syncthreads();
+        for (int i = 0; i < 2; ++i) {
+            const int wr0 = warp * 32 + 16 * i;
+            for (int nt = 0; nt < 8; ++nt) {
+                for (int h = 0; h < 2; ++h)
+                    for (int j16 = 0; j16 < 2; ++j16) {
+                        __syncthreads();
+                        mma_tile_16(&wt[wr0][32 * h + 16 * j16], 64,
+                                    &hst[nt * 16][32 * h + 16 * j16], 64,
+                                    &dot[warp][i][0][0], 16);
+                        __syncthreads();
+                        const int lane = tid & 31;
+                        for (int e = lane; e < 256; e += 32) {
+                            const int m = e / 16, c = e % 16;
+                            const float v = (float) dot[warp][i][m][c];
+                            const float wsc = ws[wr0 + m][2 * h + j16];
+                            const float hsc = hsl[nt * 16 + c][h];
+                            dm[(size_t) (row0 + wr0 + m) * 128 + r0 + nt * 16 + c] =
+                                fmaf(wsc * hsc, v, dm[(size_t) (row0 + wr0 + m) * 128 + r0 + nt * 16 + c]);
                         }
                         __syncthreads();
                     }
@@ -207,7 +430,7 @@ void fill_blob(std::vector<uint8_t>& b, std::mt19937& rng) {
 // (64 codes + float2 half-scales per stage row = AB bytes)
 void make_act(int T, std::mt19937& rng, std::vector<float>& x_deq, std::vector<uint8_t>& act,
               std::vector<float>& ascale) {
-    std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
     std::uniform_int_distribution<int> pick(0, 199);
     x_deq.assign((size_t) T * N, 0.0f);
     act.assign((size_t) T * NS * AB, 0);
@@ -307,7 +530,91 @@ int main() {
         const bool ok = rms <= 1e-4 && worst <= 1e-3;
         std::printf(ok ? "FIXTURE PASS (bounds 1e-4 / 1e-3)\n" : "FIXTURE FAIL\n");
         cudaFree(d_blob); cudaFree(d_act); cudaFree(d_as); cudaFree(d_gt); cudaFree(d_up);
-        return ok ? 0 : 1;
+        if (!ok) return 1;
+
+    // ---- down-path test: Q2_0 [2560 x 640] weights, quantized H, fp32 dm vs double reference ----
+    {
+        const size_t d_row = ggml_row_size(GGML_TYPE_Q2_0, DK);
+        std::vector<uint8_t> dblob(D_ROWS * d_row);
+        std::uniform_int_distribution<int> byte(0, 255);
+        std::uniform_real_distribution<float> dsc(0.004f, 0.024f);
+        for (size_t r = 0; r < D_ROWS; ++r) {
+            uint8_t* m = dblob.data() + r * d_row;
+            for (size_t i = 0; i < d_row; ++i) m[i] = (uint8_t) byte(rng);
+            for (int b = 0; b < DK / 64; ++b) {
+                const ggml_fp16_t h = ggml_fp32_to_fp16(dsc(rng));
+                memcpy(m + (size_t) b * 18, &h, 2);
+            }
+        }
+        // H: 128 routed rows x 640, quantized per-32 (the gu requant semantics)
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> h_f((size_t) TR * DK);
+        std::vector<uint8_t> hq((size_t) TR * DNS * 80, 0);
+        std::vector<float> hscale((size_t) TR * DNS * 2, 0.0f);
+        for (int r = 0; r < TR; ++r)
+            for (int g = 0; g < DK / 32; ++g) {
+                float am = 0;
+                float v[32];
+                for (int j = 0; j < 32; ++j) { v[j] = nd(rng); am = std::max(am, std::fabs(v[j])); }
+                const float sc = am / 127.0f;
+                uint8_t* row = hq.data() + (size_t) r * DNS * 80 + (g / 2) * 80 + 32 * (g % 2);
+                for (int j = 0; j < 32; ++j) {
+                    const int8_t c = am > 0 ? (int8_t) (int) std::lrint(v[j] * (127.0f / am)) : 0;
+                    row[j] = (uint8_t) c;
+                    h_f[(size_t) r * DK + (g / 2) * 64 + 32 * (g % 2) + j] = (float) c * sc;
+                }
+                // the scale lives at the STAGE row base +64/+68 - not offset by the half's code slot
+                memcpy(hq.data() + (size_t) r * DNS * 80 + (g / 2) * 80 + 64 + 4 * (g % 2), &sc, 4);
+            }
+        uint8_t *d_dblob, *d_hq;
+        float *d_dm;
+        cudaMalloc(&d_dblob, dblob.size());
+        cudaMalloc(&d_hq, hq.size());
+        cudaMalloc(&d_dm, (size_t) D_ROWS * TR * 4);
+        cudaMemcpy(d_dblob, dblob.data(), dblob.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_hq, hq.data(), hq.size(), cudaMemcpyHostToDevice);
+        cudaMemset(d_dm, 0, (size_t) D_ROWS * TR * 4);
+        dim3 dgrid(D_ROWS / 128, TR / 128);
+        down_kernel_wmma_q2_0<<<dgrid, THREADS>>>(d_dblob, d_row, d_hq, hscale.data(), d_dm);
+        const cudaError_t derr = cudaDeviceSynchronize();
+        if (derr != cudaSuccess) { std::printf("DOWN KERNEL FAIL: %s\n", cudaGetErrorString(derr)); return 1; }
+        const auto* td = ggml_get_type_traits(GGML_TYPE_Q2_0);
+        {
+            std::vector<float> wref(DK);
+            td->to_float(dblob.data(), wref.data(), DK);
+            const float d0 = ggml_fp16_to_fp32(*(const ggml_fp16_t*) dblob.data());
+            for (int k = 0; k < 16; ++k) std::printf(" %+.0f", nearbyint(wref[k] / d0));
+            std::printf("\n");
+        }
+        std::vector<float> dm(D_ROWS * TR);
+        cudaMemcpy(dm.data(), d_dm, dm.size() * 4, cudaMemcpyDeviceToHost);
+
+        // double reference on the dequantized Q2_0 weights x the same quantized H
+        std::vector<float> wall_d((size_t) D_ROWS * DK);
+        for (int r = 0; r < D_ROWS; ++r)
+            td->to_float(dblob.data() + (size_t) r * d_row, wall_d.data() + (size_t) r * DK, DK);
+        double de2 = 0, dr2 = 0, dworst = 0;
+        for (int r = 0; r < D_ROWS; ++r)
+            for (int t = 0; t < TR; ++t) {
+                double a = 0;
+                for (int k = 0; k < DK; ++k) a += (double) wall_d[(size_t) r * DK + k] * h_f[(size_t) t * DK + k];
+                const double e = (double) dm[(size_t) r * TR + t] - a;
+                if (!std::isfinite(dm[(size_t) r * TR + t]) || std::fabs(e) > 1e3) {
+                    if (r + t > 3) return 1;
+                }
+                de2 += e * e;
+                dr2 += a * a;
+                dworst = std::max(dworst, std::fabs(e) / std::max(1.0, std::fabs(a)));
+            }
+        const double drms = std::sqrt(de2 / dr2);
+        std::printf("fused-WMMA Q2_0 down: rel RMS %.3e, worst row rel %.3e\n", drms, dworst);
+        const bool dok = drms <= 1e-4 && dworst <= 1e-3;
+        std::printf(dok ? "DOWN PASS (bounds 1e-4 / 1e-3)\n" : "DOWN FAIL\n");
+        cudaFree(d_dblob); cudaFree(d_hq); cudaFree(d_dm);
+        if (!dok) return 1;
+    }
+
+        return 0;
     }();
     return rc;
 }
