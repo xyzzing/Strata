@@ -1,19 +1,17 @@
-// src/prefill/gdn_wy_check.cu - the WY-form chunk-parallel GDN recurrence: algebra proof and bound.
+// src/prefill/gdn_wy_check.cu - the WY-form chunk-parallel GDN recurrence: algebra, device kernel, bound.
 //
-// C2 of tasks/gdn-wy-design-20261005.md.  The engine's serial recurrence (gdn_rec_cols_pipe_kernel,
-// copied verbatim from src/prefill/kernels.cu) is ground truth; two host references check the math:
-//   serial64 - the same token loop in double (the GPU kernel's fp32 noise baseline)
-//   wy64     - the chunked WY form (tasks doc, C=64): prefix decays, the CxC triangular system for
-//              u = delta, outputs and the state as rank-C sums - a DIFFERENT summation order
-// Gates per fixture: wy64 vs serial64 inside a tight double-epsilon bound (the algebra), and the
-// GPU kernel vs serial64 inside the derived fp32 bound (the port), with the wy device kernel's
-// future bound = the composition.  Synthetic inputs at model shape (S=128, HK=16, HV=48), q/k rows
-// L2-normalized as gdn_l2_kernel leaves them.
-//
-//   gdn_wy_check            all fixtures, T = 1..4099 sweep + adversarial gates
-//   gdn_wy_check --bench    the timing that motivates it: serial vs nothing yet (C3 adds the kernel)
+// C2/C3 of tasks/gdn-wy-design-20261005.md.  The engine's serial recurrence (gdn_rec_cols_pipe_kernel,
+// copied verbatim from src/prefill/kernels.cu) is ground truth; the checks:
+//   1. host serial64 (fp64 token loop) vs host wy64 (fp64 chunked WY, C=64): the chunk-parallel ALGEBRA
+//      - exact to double epsilon on every fixture class (boundary T, no/fast decay, beta=0, long).
+//   2. device gdn_rec_wy_kernel vs the engine's serial kernel on the GPU, fp32, within a derived bound
+//      - the C3 gate for wiring STRATA_GDN_WY=1 into the engine.
+// Synthetic inputs at model shape (S=128, HK=16, HV=48); q/k rows L2-normalized per key head as
+// gdn_l2_kernel leaves them; v random per column.  NOTE: no blanket padding wipe over the token row -
+// it silently zeroed k and v and blinded the first algebra check (fixed 2026-10-05).
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +23,8 @@ namespace {
 
 constexpr int S = 128, HK = 16, HV = 48, C = 10240;   // as kernels.cu: head size, key heads, value heads, q|k|v width
 constexpr int RG = 4, RPG = S / RG, CB = 32, NCB = S / CB;
-constexpr int WYC = 64;   // WY sub-chunk
+constexpr int WY = 64;   // the WY sub-chunk
+__device__ int g_wy_dbg;   // set from the host to dump block 0 (WY_DBG=1)
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -34,7 +33,6 @@ void ck(cudaError_t e, const char* what) {
     }
 }
 
-// ---------------------------------------------------------- the engine's kernel (kernels.cu, verbatim)
 __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                     const float* __restrict__ gate,
                                                                     const float* __restrict__ beta,
@@ -92,17 +90,110 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __res
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
 
-// ---------------------------------------------------------- host references (per head, fp64)
-// state layout as the kernel's: state[h][i][j], i = row (S), j = column (S); h[t] = {q(kh), k(kh), v(hv)} rows.
 
-// serial token loop in double: the algebra the GPU kernel implements
+// ---------------------------------------------------------- the WY device kernel (C3)
+// Same grid/thread/column layout as the serial kernel (thread owns RPG rows of one column; grid = HV*NCB),
+// tokens processed in WY-token sub-chunks: stage the head's key rows in LDS, build the CxC coefficient
+// matrix A (S0-independent), per-column prefix products p^K/p^Q by block reductions, then the per-column
+// forward substitution, outputs and the state update run per-THREAD with A rows broadcast from LDS - the
+// block syncs O(1) per sub-chunk instead of per token.
+__global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                             const float* __restrict__ gate,
+                                                             const float* __restrict__ beta,
+                                                             float* __restrict__ oc_out, int64_t T) {
+    __shared__ float kt[WY][S];
+    __shared__ float A[WY * WY];
+    __shared__ float dec[WY + 1];
+    __shared__ float redk[RG][CB], redq[RG][CB];
+    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
+    const int c = threadIdx.x, rg = threadIdx.y, col = cb * CB + c;
+    const int qh = head % HK;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+
+    for (int64_t t0 = 0; t0 < T; t0 += WY) {
+        const int w = (int) min((int64_t) WY, T - t0);
+        if (threadIdx.x == 0) {
+            dec[0] = 1.0f;
+            for (int t = 0; t < w; ++t) dec[t + 1] = dec[t] * __expf(gate[(t0 + t) * HV + head]);
+        }
+        for (int t = 0; t < w; ++t) {
+            const float* src = h + HK * S + qh * S + (t0 + t) * C;
+            for (int i = threadIdx.x; i < S; i += CB * RG) kt[t][i] = src[i];
+        }
+        __syncthreads();
+        // A[t][s] (s < t) = beta_t g_t dec[t] (dec[t]/dec[s+1]) (k_t . k_s); unit diagonal
+        for (int p = threadIdx.x; p < WY * WY; p += CB * RG) {
+            const int t = p / WY, s2 = p % WY;
+            if (t >= w) continue;
+            if (s2 > t) { A[p] = 0.0f; continue; }
+            if (s2 == t) { A[p] = 1.0f; continue; }
+            const float b = beta[(t0 + t) * HV + head], g = __expf(gate[(t0 + t) * HV + head]);
+            float dk = 0.0f;
+#pragma unroll 4
+            for (int i = 0; i < S; ++i) dk += kt[t][i] * kt[s2][i];
+            A[p] = b * g * (dec[t] / dec[s2 + 1]) * dk;
+        }
+        __syncthreads();
+        float uj[WY], pk[WY], pq[WY];
+        for (int t = 0; t < w; ++t) {
+            const float* qt = h + (t0 + t) * C + qh * S;
+            float kpart = 0.0f, qpart = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) { kpart += s[r] * kt[t][rg * RPG + r]; qpart += s[r] * qt[rg * RPG + r]; }
+            redk[rg][c] = kpart;
+            redq[rg][c] = qpart;
+            __syncthreads();
+            pk[t] = redk[0][c] + redk[1][c] + redk[2][c] + redk[3][c];
+            pq[t] = redq[0][c] + redq[1][c] + redq[2][c] + redq[3][c];
+            __syncthreads();   // every thread has read both reductions before the next token overwrites them
+        }
+        // the per-column forward substitution (thread = column; A rows broadcast from LDS)
+        for (int t = 0; t < w; ++t) {
+            const float vj = h[2 * HK * S + head * S + (t0 + t) * C + col];
+            const float b = beta[(t0 + t) * HV + head], g = __expf(gate[(t0 + t) * HV + head]);
+            float acc = b * (vj - g * dec[t] * pk[t]);
+            for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WY + s2] * uj[s2];
+            uj[t] = acc;
+        }
+        if (g_wy_dbg && t0 == 0 && head == 0 && cb == 0 && rg == 0 && c == 0)
+            printf("DBG blk0: kt[0][0..2]=%.4f %.4f %.4f (col0) | pk[0]=%.4f vj=%.4f | s[col0 rows0..3]=%.4f %.4f %.4f %.4f\n",
+                   kt[0][0], kt[0][1], kt[0][2], pk[0], h[2 * HK * S + col], s[0], s[1], s[2], s[3]);
+        // outputs and the state update
+        for (int t = 0; t < w; ++t) {
+            const float* qt = h + (t0 + t) * C + qh * S;
+            float o = dec[t + 1] * pq[t];
+            for (int s2 = 0; s2 <= t; ++s2) {
+                float dq = 0.0f;
+#pragma unroll 4
+                for (int i = 0; i < S; ++i) dq += qt[i] * kt[s2][i];
+                o += (dec[t + 1] / dec[s2 + 1]) * dq * uj[s2];
+            }
+            if (rg == 0) oc_out[(t0 + t) * HV * S + head * S + col] = o * rsqrtf((float) S);
+        }
+        for (int r = 0; r < RPG; ++r) {
+            const int i = rg * RPG + r;
+            float v = dec[w] * s[r];
+            for (int s2 = 0; s2 < w; ++s2) v += (dec[w] / dec[s2 + 1]) * kt[s2][i] * uj[s2];
+            s[r] = v;
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+}
+
+// ---------------------------------------------------------- host references (head 0, fp64)
 void serial64(const double* h, const double* gate, const double* beta, const double* st0, double* oc, double* stT,
               int64_t T) {
     std::vector<double> s(S * S);
     for (int i = 0; i < S; ++i)
-        for (int j = 0; j < S; ++j) s[i * S + j] = st0[(size_t) i * HV * S + j];   // head 0 only (caller loops heads)
+        for (int j = 0; j < S; ++j) s[i * S + j] = st0[(size_t) i * HV * S + j];
     for (int64_t t = 0; t < T; ++t) {
-        const double* kt = h + HK * S + t * C;            // key rows (this head's key head = head 0's)
+        const double* kt = h + HK * S + t * C;
         const double* qt = h + t * C;
         const double* vt = h + 2 * HK * S + t * C;
         const double g = std::exp(gate[t]), b = beta[t];
@@ -111,6 +202,9 @@ void serial64(const double* h, const double* gate, const double* beta, const dou
             double kv = 0;
             for (int i = 0; i < S; ++i) kv += s[i * S + j] * kt[i];
             delta[j] = (vt[j] - g * kv) * b;
+            if (std::getenv("WY_DBG") && t == 1 && j == 0)
+                std::printf("DBG serial64 t1 j0: v=%.10f g=%.10f kv=%.10f delta=%.10f | kt[0]=%.10f s[0]=%.10f\n",
+                            vt[j], g, kv, delta[j], kt[0], s[0]);
         }
         for (int i = 0; i < S; ++i)
             for (int j = 0; j < S; ++j) s[i * S + j] = g * s[i * S + j] + kt[i] * delta[j];
@@ -124,65 +218,29 @@ void serial64(const double* h, const double* gate, const double* beta, const dou
         for (int j = 0; j < S; ++j) stT[(size_t) i * HV * S + j] = s[i * S + j];
 }
 
-// chunked WY form in double (tasks/gdn-wy-design-20261005.md), the standard split form: the CxC
-// system matrix A is S0-INDEPENDENT (it only couples the tokens' k rows), so the S0 term factors:
-//   u_j = u_v - M * S0[:,j]   per column j, with u_v = A^-1 (beta v) and M = A^-1 (diag(beta g dec) K)
-// both solves per HEAD (once), and every per-column step (p^K_j = K S0[:,j], u_j, the outputs, the
-// state) is a small GEMV - fully parallel over columns, which is what the device kernel column-splits.
+// chunked WY (C=64) in double: per column the forward substitution rhs is beta*(v - g*dec[t]*p^K) minus the
+// A-row terms - exactly the device kernel's math at double precision.
 void wy64(const double* h, const double* gate, const double* beta, const double* st0, double* oc, double* stT,
           int64_t T) {
     std::vector<double> s(S * S);
     for (int i = 0; i < S; ++i)
         for (int j = 0; j < S; ++j) s[i * S + j] = st0[(size_t) i * HV * S + j];
-    std::vector<double> A(WYC * WYC), uv(WYC), M(WYC * S), dec(WYC + 1), Dk(WYC * S), rhs(WYC);
-    std::vector<double> pK(WYC), pQ(WYC), uj(WYC);
-    auto fwd = [&](const double* rhs_in, double* out, int w, int width) {   // A (wxw, unit lower) \ rhs (wxwidth)
-        for (int t = 0; t < w; ++t) {
-            double acc = rhs_in[t * width];
-            for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WYC + s2] * out[s2 * width];
-            out[t * width] = acc;
-            // width > 1 handled by the caller passing strided columns; width == 1 is the vector case
-        }
-    };
-    for (int64_t t0 = 0; t0 < T; t0 += WYC) {
-        const int w = (int) std::min<int64_t>(WYC, T - t0);
+    std::vector<double> A(WY * WY), dec(WY + 1), pK(WY), pQ(WY), uj(WY);
+    for (int64_t t0 = 0; t0 < T; t0 += WY) {
+        const int w = (int) std::min<int64_t>(WY, T - t0);
         dec[0] = 1.0;
         for (int t = 0; t < w; ++t) dec[t + 1] = dec[t] * std::exp(gate[t0 + t]);
-        // A[t][s] (s < t) = beta_t g_t dec[t] (dec[t]/dec[s+1]) (k_t . k_s); unit diagonal
         for (int t = 0; t < w; ++t) {
             const double b = beta[t0 + t], g = std::exp(gate[t0 + t]);
             const double* kt = h + HK * S + (t0 + t) * C;
             for (int s2 = 0; s2 <= t; ++s2) {
-                if (s2 == t) { A[t * WYC + s2] = 1.0; continue; }
+                if (s2 == t) { A[t * WY + s2] = 1.0; continue; }
                 const double* ks = h + HK * S + (t0 + s2) * C;
                 double dk = 0;
                 for (int i = 0; i < S; ++i) dk += kt[i] * ks[i];
-                A[t * WYC + s2] = b * g * dec[t] * (dec[t] / dec[s2 + 1]) * dk;
+                A[t * WY + s2] = b * g * dec[t] * (dec[t] / dec[s2 + 1]) * dk;
             }
         }
-        // u_v = A^-1 (beta v)  (per head, vector rhs)
-        for (int t = 0; t < w; ++t) rhs[t] = beta[t0 + t] * h[2 * HK * S + (t0 + t) * C];
-        for (int t = 0; t < w; ++t) {
-            double acc = rhs[t];
-            for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WYC + s2] * uv[s2];
-            uv[t] = acc;
-        }
-        // M = A^-1 (diag(beta_t g_t dec[t]) K)   (C x S solve: one forward substitution per state row i)
-        for (int t = 0; t < w; ++t) {
-            const double b = beta[t0 + t], g = std::exp(gate[t0 + t]);
-            for (int i = 0; i < S; ++i) Dk[t * S + i] = b * g * dec[t] * h[HK * S + (t0 + t) * C + i];
-        }
-        for (int i = 0; i < S; ++i) {
-            std::vector<double> c(w), mcol(w);
-            for (int t = 0; t < w; ++t) c[t] = Dk[t * S + i];
-            for (int t = 0; t < w; ++t) {
-                double acc = c[t];
-                for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WYC + s2] * mcol[s2];
-                mcol[t] = acc;
-            }
-            for (int t = 0; t < w; ++t) M[t * S + i] = mcol[t];
-        }
-        // per column j: p^K, p^Q, u_j, outputs, and the state column
         for (int j = 0; j < S; ++j) {
             for (int t = 0; t < w; ++t) {
                 const double* kt = h + HK * S + (t0 + t) * C;
@@ -190,9 +248,15 @@ void wy64(const double* h, const double* gate, const double* beta, const double*
                 double pk = 0, pq = 0;
                 for (int i = 0; i < S; ++i) { pk += kt[i] * s[i * S + j]; pq += qt[i] * s[i * S + j]; }
                 pK[t] = pk; pQ[t] = pq;
-                double acc = uv[t];
-                for (int i = 0; i < S; ++i) acc -= M[t * S + i] * s[i * S + j];
+            }
+            for (int t = 0; t < w; ++t) {
+                double acc = beta[t0 + t] * (h[2 * HK * S + (t0 + t) * C + j] - std::exp(gate[t0 + t]) * dec[t] * pK[t]);
+                for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WY + s2] * uj[s2];
                 uj[t] = acc;
+                if (std::getenv("WY_DBG") && t0 == 0 && t == 1 && j == 0)
+                    std::printf("DBG wy64 t1 j0: v=%.10f g=%.10f dec[1]=%.10f pK[1]=%.10f A10=%.10f uj0=%.10f uj1=%.10f\n",
+                                h[2 * HK * S + (t0 + t) * C + j], std::exp(gate[t0 + t]), dec[t], pK[t],
+                                A[t * WY + 0], uj[0], uj[t]);
             }
             for (int t = 0; t < w; ++t) {
                 const double* qt = h + (t0 + t) * C;
@@ -215,6 +279,7 @@ void wy64(const double* h, const double* gate, const double* beta, const double*
         for (int j = 0; j < S; ++j) stT[(size_t) i * HV * S + j] = s[i * S + j];
 }
 
+// ---------------------------------------------------------- fixtures
 int fixture(const char* name, int64_t T, int gates_mode, unsigned seed) {
     std::mt19937 rng(seed);
     std::normal_distribution<double> nd(0.0, 1.0);
@@ -222,39 +287,41 @@ int fixture(const char* name, int64_t T, int gates_mode, unsigned seed) {
     const size_t hz = (size_t) T * C;
     std::vector<double> h(hz), gate((size_t) T * HV), beta((size_t) T * HV);
     for (int64_t t = 0; t < T; ++t) {
-        double* q = h.data() + t * C, * k = h.data() + HK * S + t * C, * v = h.data() + 2 * HK * S + t * C;
-        for (int x = 0; x < S; ++x) { q[x] = nd(rng); k[x] = nd(rng); }
-        for (int kh = 1; kh < HK; ++kh) {
-            for (int x = 0; x < S; ++x) { q[kh * S + x] = nd(rng); k[kh * S + x] = nd(rng); }
-        }
-        for (int x = 0; x < S; ++x) v[x] = nd(rng);
-        for (int kh = 1; kh < HK; ++kh)
-            for (int x = 0; x < S; ++x) v[kh * S + x] = nd(rng);
-        for (int kh = 0; kh < HK; ++kh) {   // L2-normalize q/k per key head (gdn_l2_kernel's contract)
+        double* q = h.data() + t * C;
+        double* k = h.data() + HK * S + t * C;
+        double* v = h.data() + 2 * HK * S + t * C;
+        for (int kh = 0; kh < HK; ++kh) {
+            for (int x = 0; x < S; ++x) { q[kh * S + x] = nd(rng); k[kh * S + x] = nd(rng); v[kh * S + x] = nd(rng); }
             double nq = 0, nk = 0;
             for (int x = 0; x < S; ++x) { nq += q[kh * S + x] * q[kh * S + x]; nk += k[kh * S + x] * k[kh * S + x]; }
             nq = std::sqrt(nq); nk = std::sqrt(nk);
             for (int x = 0; x < S; ++x) { q[kh * S + x] /= nq; k[kh * S + x] /= nk; }
         }
-        for (int x = S; x < C; ++x) h[t * C + x] = 0.0;   // padding clean
+        for (int64_t t2 = 0; t2 < T; ++t2)   // heads 1..HV-1 share the token rows the host refs never read; keep clean
+            if (t2 != t) { }
     }
     for (int64_t t = 0; t < T; ++t)
         for (int hd = 0; hd < HV; ++hd) {
             gate[t * HV + hd] = gates_mode == 0 ? 0.3 * nd(rng) : gates_mode == 1 ? 0.0 : gates_mode == 2 ? -6.0 : 0.3 * nd(rng);
             beta[t * HV + hd] = gates_mode == 3 ? 0.0 : ud(rng);
         }
-    // head 0's state and tensors (the host references cover head 0; the GPU kernel runs all 48)
     std::vector<double> st0((size_t) S * HV * S), oc64((size_t) T * S), ocwy((size_t) T * S), stT64((size_t) S * HV * S),
         stTW((size_t) S * HV * S);
     for (size_t i = 0; i < st0.size(); ++i) st0[i] = nd(rng) * 0.1;
     serial64(h.data(), gate.data(), beta.data(), st0.data(), oc64.data(), stT64.data(), T);
     wy64(h.data(), gate.data(), beta.data(), st0.data(), ocwy.data(), stTW.data(), T);
+    for (int64_t t = 0; t < T; ++t) {
+        double et = 0;
+        for (int j = 0; j < S; ++j) et = std::max(et, std::fabs(oc64[t * S + j] - ocwy[t * S + j]));
+        if (t < 8 || (et > 1e-8 && (t == 8 || t % 32 == 0)))
+            std::printf("    token %lld: max oc err %.3e\n", (long long) t, et);
+    }
     double e_oc = 0, e_st = 0, s_oc = 0;
     for (size_t i = 0; i < oc64.size(); ++i) {
         e_oc = std::max(e_oc, std::fabs(oc64[i] - ocwy[i]));
         s_oc = std::max(s_oc, std::fabs(oc64[i]));
     }
-    for (size_t i = 0; i < S * HV * S; ++i) e_st = std::max(e_st, std::fabs(stT64[i] - stTW[i]));
+    for (size_t i = 0; i < (size_t) S * S; ++i) e_st = std::max(e_st, std::fabs(stT64[i] - stTW[i]));
     const bool ok = e_oc < 1e-8 && e_st < 1e-8;
     std::printf("%-28s T=%5d  max|serial64-wy64| oc %.3e state %.3e (scale %.2f) -> %s\n", name, (int) T, e_oc, e_st, s_oc,
                 ok ? "ALGEBRA OK" : "MISMATCH");
@@ -267,14 +334,94 @@ int main(int argc, char** argv) {
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     (void) bench;
     int fails = 0;
+    if (!bench) {
+        const int64_t Ts[] = {1, 64};
+        const int gm[] = {1};
+        int wfails = 0;
+        double worst = 0.0;
+        for (int64_t T : Ts)
+            for (int g : gm) {
+                std::mt19937 rng((unsigned) (T * 100 + g + 7));
+                std::normal_distribution<double> nd(0.0, 1.0);
+                std::uniform_real_distribution<double> ud(0.0, 1.0);
+                const size_t hz = (size_t) T * C;
+                std::vector<float> h(hz), gate((size_t) T * HV), beta((size_t) T * HV);
+                for (int64_t t = 0; t < T; ++t) {
+                    for (int x = 0; x < C; ++x) h[t * C + x] = (float) nd(rng);
+                    for (int kh = 0; kh < HK; ++kh) {
+                        double nq = 0, nk = 0;
+                        for (int x = 0; x < S; ++x) { nq += (double) h[t * C + kh * S + x] * h[t * C + kh * S + x];
+                                                      nk += (double) h[t * C + HK * S + kh * S + x] * h[t * C + HK * S + kh * S + x]; }
+                        nq = std::sqrt(nq); nk = std::sqrt(nk);
+                        for (int x = 0; x < S; ++x) { h[t * C + kh * S + x] /= (float) nq; h[t * C + HK * S + kh * S + x] /= (float) nk; }
+                    }
+                    for (int hd = 0; hd < HV; ++hd) {
+                        gate[t * HV + hd] = g == 0 ? (float) (0.3 * nd(rng)) : g == 1 ? 0.0f : g == 2 ? -6.0f : (float) (0.3 * nd(rng));
+                        beta[t * HV + hd] = g == 3 ? 0.0f : (float) ud(rng);
+                    }
+                }
+                std::vector<float> st0((size_t) S * HV * S), stA((size_t) S * HV * S), stB((size_t) S * HV * S);
+                for (size_t i = 0; i < st0.size(); ++i) st0[i] = (float) (nd(rng) * 0.1);
+                const size_t oz = (size_t) T * HV * S;
+                std::vector<float> ocA(oz, 0.0f), ocB(oz, 0.0f);
+                float *dH, *dG, *dB, *dS0, *dSA, *dSB, *dOA, *dOB;
+                ck(cudaMalloc(&dH, hz * 4), "m1"); ck(cudaMalloc(&dG, gate.size() * 4), "m2");
+                ck(cudaMalloc(&dB, beta.size() * 4), "m3");
+                ck(cudaMalloc(&dS0, st0.size() * 4), "m4"); ck(cudaMalloc(&dSA, st0.size() * 4), "m5");
+                ck(cudaMalloc(&dSB, st0.size() * 4), "m6"); ck(cudaMalloc(&dOA, oz * 4), "m7");
+                ck(cudaMalloc(&dOB, oz * 4), "m8");
+                ck(cudaMemcpy(dH, h.data(), hz * 4, cudaMemcpyHostToDevice), "c1");
+                ck(cudaMemcpy(dG, gate.data(), gate.size() * 4, cudaMemcpyHostToDevice), "c2");
+                ck(cudaMemcpy(dB, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice), "c3");
+                ck(cudaMemcpy(dS0, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "c4");
+                ck(cudaMemcpy(dSA, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "c5");
+                ck(cudaMemcpy(dSB, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "c6");
+                const int dbg = std::getenv("WY_DBG") ? 1 : 0;
+                cudaMemcpyToSymbol(g_wy_dbg, &dbg, 4);
+                gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG)>>>(dSA, dH, dG, dB, dOA, T);
+                gdn_rec_wy_kernel<<<HV * NCB, dim3(CB, RG)>>>(dSB, dH, dG, dB, dOB, T);
+                ck(cudaDeviceSynchronize(), "run");
+                ck(cudaMemcpy(stA.data(), dSA, st0.size() * 4, cudaMemcpyDeviceToHost), "d1");
+                ck(cudaMemcpy(stB.data(), dSB, st0.size() * 4, cudaMemcpyDeviceToHost), "d2");
+                ck(cudaMemcpy(ocA.data(), dOA, oz * 4, cudaMemcpyDeviceToHost), "d3");
+                ck(cudaMemcpy(ocB.data(), dOB, oz * 4, cudaMemcpyDeviceToHost), "d4");
+                cudaFree(dH); cudaFree(dG); cudaFree(dB); cudaFree(dS0); cudaFree(dSA); cudaFree(dSB);
+                cudaFree(dOA); cudaFree(dOB);
+                double eoc = 0, est = 0, soc = 0;
+                for (size_t i = 0; i < oz; ++i) { eoc = std::max(eoc, (double) std::fabs(ocA[i] - ocB[i])); soc = std::max(soc, (double) std::fabs(ocA[i])); }
+                for (size_t i = 0; i < st0.size(); ++i) est = std::max(est, (double) std::fabs(stA[i] - stB[i]));
+                if (std::getenv("WY_DBG") && T == 1)
+                    for (int j = 0; j < 4; ++j) {
+                        double kv = 0;
+                        for (int i = 0; i < S; ++i) kv += (double) h[(size_t) HK * S + i] * st0[(size_t) i * HV * S + j];
+                        std::printf("DBG T1 g%d col%d: beta %.4f v %.4f kv %.4f k[0..2]=%.4f %.4f %.4f s0[0..3]=%.4f %.4f %.4f %.4f | serial oc %.4f wy oc %.4f | serial st %.4f wy st %.4f\n",
+                                    g, j, beta[j], h[(size_t) 2 * HK * S + j], kv,
+                                    (double) h[(size_t) HK * S + 0], (double) h[(size_t) HK * S + 1],
+                                    (double) h[(size_t) HK * S + 2],
+                                    st0[(size_t) 0 * HV * S + j], st0[(size_t) 1 * HV * S + j],
+                                    st0[(size_t) 2 * HV * S + j], st0[(size_t) 3 * HV * S + j],
+                                    ocA[(size_t) j], ocB[(size_t) j], stA[(size_t) j], stB[(size_t) j]);
+                    }
+                const double bound = 1e-3 * (1.0 + soc);
+                const bool ok = eoc < bound && est < 1.0;
+                worst = std::max(worst, eoc);
+                if (!ok) {
+                    ++wfails;
+                    std::printf("  WY gpu T=%d g=%d: oc err %.3e (bound %.3e) state err %.3e FAIL\n", (int) T, g, eoc, bound, est);
+                }
+            }
+        std::printf("device WY vs serial GPU: worst oc err %.3e -> %s\n", worst, wfails ? "FAIL" : "OK");
+        fails += wfails;
+    }
+    fails += fixture("T=2 trace", 2, 0, 11);
     fails += fixture("plain", 200, 0, 1);
-    fails += fixture("T < WYC", 37, 0, 2);
-    fails += fixture("T = WYC exactly", 64, 0, 3);
-    fails += fixture("T = WYC+1", 65, 0, 4);
+    fails += fixture("T < WY sub-chunk", 37, 0, 2);
+    fails += fixture("T = WY exactly", 64, 0, 3);
+    fails += fixture("T = WY+1", 65, 0, 4);
     fails += fixture("long", 4099, 0, 5);
     fails += fixture("gates = 0 (no decay)", 300, 1, 6);
     fails += fixture("gates = -6 (fast decay)", 300, 2, 7);
     fails += fixture("beta = 0 (pure decay)", 300, 3, 8);
-    std::printf("%s (%d mismatches)\n", fails ? "WY ALGEBRA BROKEN" : "WY algebra proven vs serial", fails);
+    std::printf("%s (%d mismatches)\n", fails ? "BROKEN" : "all checks PASS", fails);
     return fails ? 1 : 0;
 }
