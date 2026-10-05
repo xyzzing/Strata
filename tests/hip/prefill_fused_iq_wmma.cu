@@ -370,7 +370,6 @@ __global__ void __launch_bounds__(THREADS) down_kernel_wmma_q2_0(
             uint32_t w[3];
             float s0, s1;
             load_unit_q2_0(bp, dec_uj, w);
-            if (s == 0 && dec_row == 0 && dec_uj == 0 && blockIdx.x == 0 && tid == 0)
             convert_q2_0(w, *(int8_t (*)[32]) & wt[dec_row][32 * dec_uj], s0, s1);
             ws[dec_row][2 * dec_uj] = s0;
             ws[dec_row][2 * dec_uj + 1] = s1;
@@ -572,9 +571,27 @@ int main() {
         cudaMemcpy(d_hq, hq.data(), hq.size(), cudaMemcpyHostToDevice);
         cudaMemset(d_dm, 0, (size_t) D_ROWS * TR * 4);
         dim3 dgrid(D_ROWS / 128, TR / 128);
+        float* d_dm2;                                        // the race probe: same launch twice, diff
+        cudaMalloc(&d_dm2, (size_t) D_ROWS * TR * 4);
+        cudaMemset(d_dm, 0, (size_t) D_ROWS * TR * 4);
         down_kernel_wmma_q2_0<<<dgrid, THREADS>>>(d_dblob, d_row, d_hq, hscale.data(), d_dm);
+        cudaDeviceSynchronize();
+        cudaMemset(d_dm2, 0, (size_t) D_ROWS * TR * 4);
+        down_kernel_wmma_q2_0<<<dgrid, THREADS>>>(d_dblob, d_row, d_hq, hscale.data(), d_dm2);
         const cudaError_t derr = cudaDeviceSynchronize();
         if (derr != cudaSuccess) { std::printf("DOWN KERNEL FAIL: %s\n", cudaGetErrorString(derr)); return 1; }
+        {
+            std::vector<float> dm1((size_t) D_ROWS * TR), dm2v((size_t) D_ROWS * TR);
+            cudaMemcpy(dm1.data(), d_dm, dm1.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(dm2v.data(), d_dm2, dm2v.size() * 4, cudaMemcpyDeviceToHost);
+            int diffs = 0, worst_i = -1;
+            float worst = 0;
+            for (size_t i = 0; i < dm1.size(); ++i)
+                if (dm1[i] != dm2v[i]) { ++diffs; if (std::fabs(dm1[i] - dm2v[i]) > worst) { worst = std::fabs(dm1[i] - dm2v[i]); worst_i = (int) i; } }
+            std::printf("RACEPROBE dm diffs: %d / %zu (worst %f at index %d: run1 %.6f run2 %.6f)\n",
+                        diffs, dm1.size(), (double) worst, worst_i,
+                        worst_i >= 0 ? (double) dm1[worst_i] : 0.0, worst_i >= 0 ? (double) dm2v[worst_i] : 0.0);
+        }
         std::vector<float> dm(D_ROWS * TR);
         cudaMemcpy(dm.data(), d_dm, dm.size() * 4, cudaMemcpyDeviceToHost);
 
