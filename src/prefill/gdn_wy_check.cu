@@ -107,6 +107,10 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__
     __shared__ float redk[RG][CB], redq[RG][CB];
     const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
     const int c = threadIdx.x, rg = threadIdx.y, col = cb * CB + c;
+    const int tid = rg * CB + c;   // flat id in [0, CB*RG) - the launch is dim3(CB, RG), so threadIdx.x
+                                   // alone is only c in [0, 32): the two strided loops below MUST stride
+                                   // tid, or kt keeps 3/4 of its columns and A 3/4 of its entries
+                                   // unwritten (uninitialized LDS -> the run-varying NaN/Inf)
     const int qh = head % HK;
     float s[RPG];
     float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
@@ -122,11 +126,11 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__
         }
         for (int t = 0; t < w; ++t) {
             const float* src = h + HK * S + qh * S + (t0 + t) * C;
-            for (int i = threadIdx.x; i < S; i += CB * RG) kt[t][i] = src[i];
+            for (int i = tid; i < S; i += CB * RG) kt[t][i] = src[i];
         }
         __syncthreads();
         // A[t][s] (s < t) = beta_t g_t dec[t] (dec[t]/dec[s+1]) (k_t . k_s); unit diagonal
-        for (int p = threadIdx.x; p < WY * WY; p += CB * RG) {
+        for (int p = tid; p < WY * WY; p += CB * RG) {
             const int t = p / WY, s2 = p % WY;
             if (t >= w) continue;
             if (s2 > t) { A[p] = 0.0f; continue; }
@@ -203,8 +207,9 @@ void serial64(const double* h, const double* gate, const double* beta, const dou
             for (int i = 0; i < S; ++i) kv += s[i * S + j] * kt[i];
             delta[j] = (vt[j] - g * kv) * b;
             if (std::getenv("WY_DBG") && t == 1 && j == 0)
-                std::printf("DBG serial64 t1 j0: v=%.10f g=%.10f kv=%.10f delta=%.10f | kt[0]=%.10f s[0]=%.10f\n",
-                            vt[j], g, kv, delta[j], kt[0], s[0]);
+                std::printf("DBG serial64 t1 j0: v=%.10f g=%.10f kv=%.10f delta=%.10f | k1[0..2]=%.10f %.10f %.10f "
+                            "Saft0[0..2]=%.10f %.10f %.10f beta1=%.10f\n",
+                            vt[j], g, kv, delta[j], kt[0], kt[1], kt[2], s[0], s[1 * S], s[2 * S], beta[t]);
         }
         for (int i = 0; i < S; ++i)
             for (int j = 0; j < S; ++j) s[i * S + j] = g * s[i * S + j] + kt[i] * delta[j];
@@ -238,7 +243,7 @@ void wy64(const double* h, const double* gate, const double* beta, const double*
                 const double* ks = h + HK * S + (t0 + s2) * C;
                 double dk = 0;
                 for (int i = 0; i < S; ++i) dk += kt[i] * ks[i];
-                A[t * WY + s2] = b * g * dec[t] * (dec[t] / dec[s2 + 1]) * dk;
+                A[t * WY + s2] = b * g * (dec[t] / dec[s2 + 1]) * dk;
             }
         }
         for (int j = 0; j < S; ++j) {
@@ -254,9 +259,12 @@ void wy64(const double* h, const double* gate, const double* beta, const double*
                 for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WY + s2] * uj[s2];
                 uj[t] = acc;
                 if (std::getenv("WY_DBG") && t0 == 0 && t == 1 && j == 0)
-                    std::printf("DBG wy64 t1 j0: v=%.10f g=%.10f dec[1]=%.10f pK[1]=%.10f A10=%.10f uj0=%.10f uj1=%.10f\n",
+                    std::printf("DBG wy64 t1 j0: v=%.10f g=%.10f dec[1]=%.10f pK[1]=%.10f A10=%.10f uj0=%.10f uj1=%.10f "
+                                "| k1[0..2]=%.10f %.10f %.10f S0[0..2]=%.10f %.10f %.10f beta1=%.10f\n",
                                 h[2 * HK * S + (t0 + t) * C + j], std::exp(gate[t0 + t]), dec[t], pK[t],
-                                A[t * WY + 0], uj[0], uj[t]);
+                                A[t * WY + 0], uj[0], uj[t],
+                                h[HK * S + (t0 + t) * C], h[HK * S + (t0 + t) * C + 1], h[HK * S + (t0 + t) * C + 2],
+                                s[0 * S + j], s[1 * S + j], s[2 * S + j], beta[t0 + t]);
             }
             for (int t = 0; t < w; ++t) {
                 const double* qt = h + (t0 + t) * C;
@@ -388,8 +396,35 @@ int main(int argc, char** argv) {
                 cudaFree(dH); cudaFree(dG); cudaFree(dB); cudaFree(dS0); cudaFree(dSA); cudaFree(dSB);
                 cudaFree(dOA); cudaFree(dOB);
                 double eoc = 0, est = 0, soc = 0;
-                for (size_t i = 0; i < oz; ++i) { eoc = std::max(eoc, (double) std::fabs(ocA[i] - ocB[i])); soc = std::max(soc, (double) std::fabs(ocA[i])); }
-                for (size_t i = 0; i < st0.size(); ++i) est = std::max(est, (double) std::fabs(stA[i] - stB[i]));
+                for (size_t i = 0; i < oz; ++i) {
+                    const double d = (double) std::fabs(ocA[i] - ocB[i]);
+                    if (std::isnan(d) || d > eoc) eoc = d;   // std::max silently DROPS NaN - a NaN state
+                    soc = std::max(soc, (double) std::fabs(ocA[i]));   // diff read as err 0.0 for a full run
+                }
+                for (size_t i = 0; i < st0.size(); ++i) {
+                    const double d = (double) std::fabs(stA[i] - stB[i]);
+                    if (std::isnan(d) || d > est) est = d;
+                }
+                // TEMP diagnostics: locate the first non-finite entry in each array (t, head, col)
+                for (int which = 0; which < 4; ++which) {
+                    const float* arr = which == 0 ? ocA.data() : which == 1 ? ocB.data() : which == 2 ? stA.data() : stB.data();
+                    const size_t n = which < 2 ? oz : st0.size();
+                    const char* nm = which == 0 ? "serial-oc" : which == 1 ? "wy-oc" : which == 2 ? "serial-st" : "wy-st";
+                    for (size_t i2 = 0; i2 < n; ++i2)
+                        if (!std::isfinite(arr[i2])) {
+                            if (which < 2) {
+                                const int64_t tt = i2 / (HV * S);
+                                const size_t rem = i2 % (HV * S);
+                                std::printf("NONFINITE %s [%zu]: t=%lld head=%zu col=%zu val=%g\n", nm, i2,
+                                            (long long) tt, rem / S, rem % S, arr[i2]);
+                            } else {
+                                const size_t row = i2 / ((size_t) HV * S), rem = i2 % ((size_t) HV * S);
+                                std::printf("NONFINITE %s [%zu]: row=%zu head=%zu col=%zu val=%g\n", nm, i2,
+                                            row, rem / S, rem % S, arr[i2]);
+                            }
+                            break;
+                        }
+                }
                 if (std::getenv("WY_DBG") && T == 1)
                     for (int j = 0; j < 4; ++j) {
                         double kv = 0;
