@@ -1296,10 +1296,14 @@ endif()
   # the fused-int8 MoE kernels' WMMA translation fixture (M2 of the moe-fused-wmma campaign):
   # IQ3_S gate/up decode -> LDS tiles -> rocWMMA int8 mma -> per-half scale fold, vs a double
   # reference on the same quantized activations; pre-declared bounds 1e-4 RMS / 1e-3 worst row
-  add_executable(prefill_fused_iq_wmma_test tests/hip/prefill_fused_iq_wmma.cu)
-  target_include_directories(prefill_fused_iq_wmma_test PRIVATE ${_strata_gpu_include_directories}
-                            ${_strata_gg}/include ${_strata_gg}/src ${_strata_gg}/src/ggml-cuda
-                            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill)
-  target_compile_definitions(prefill_fused_iq_wmma_test PRIVATE GGML_USE_HIP=1)
-  target_link_libraries(prefill_fused_iq_wmma_test PRIVATE strata_mmq ${_strata_gpu_runtime_target})
-  add_test(NAME prefill_fused_iq_wmma_test COMMAND prefill_fused_iq_wmma_test)
+  # HIP-only (rocwmma): outside a GPU backend the .cu target has no linker language and
+  # configure fails (the fork CI's CPU job, run 37380884285)
+  if(STRATA_ENABLE_HIP)
+    add_executable(prefill_fused_iq_wmma_test tests/hip/prefill_fused_iq_wmma.cu)
+    target_include_directories(prefill_fused_iq_wmma_test PRIVATE ${_strata_gpu_include_directories}
+                              ${_strata_gg}/include ${_strata_gg}/src ${_strata_gg}/src/ggml-cuda
+                              ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill)
+    target_compile_definitions(prefill_fused_iq_wmma_test PRIVATE GGML_USE_HIP=1)
+    target_link_libraries(prefill_fused_iq_wmma_test PRIVATE strata_mmq ${_strata_gpu_runtime_target})
+    add_test(NAME prefill_fused_iq_wmma_test COMMAND prefill_fused_iq_wmma_test)
+  endif()

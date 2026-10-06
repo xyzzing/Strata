@@ -95,7 +95,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     container:
-      image: rocm/dev-ubuntu-24.04:7.1-complete
+      # 10.1, not 7.x: the 7.1 image's hipclang rejects the upstream iq_kernels.cu
+      # `__shared__ alignas(16)` construct (hard error); 10.x accepts it (the production
+      # nightly 10.2.0a toolchain compiles this tree locally)
+      image: rocm/dev-ubuntu-24.04:10.1.0-full
     steps:
       - name: Install build tools
         run: >
