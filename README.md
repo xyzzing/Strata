@@ -13,6 +13,19 @@ Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Nex
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.
 
+> **This fork adds RDNA3:** a working HIP port for gfx1100 (Radeon RX 7900 XT/XTX/GRE) — the AMD numbers above
+> are RDNA4 (RX 9070 XT); here the same engine is parity-tested and measured on a 7900 XTX: decode 57–64 tok/s
+> from 1K to 128K context, prefill up to ~1.9K tok/s @128K with the opt-in tensor-core arms (0.1.39-line
+> measurements; the 0.1.40 re-baseline is pending — see [GFX1100.md](GFX1100.md)). Numbers, flags and
+> evidence: **[GFX1100.md](GFX1100.md)** · port thread
+> [Niko1221/Strata#106](https://github.com/Niko1221/Strata/issues/106)
+>
+> **How this was made:** the port, its verification campaigns and these docs were produced by an AI engineering
+> agent powered by **GLM-5.3 (Z.ai)** working under [xyzzing](https://github.com/xyzzing)'s direction — every
+> number traces to a recorded measurement on this machine. The measured model is Qwen3.8-Flash-Next, served as
+> the local resident with its MTP draft layer as the speculative-decoding drafter (full credits in
+> [GFX1100.md](GFX1100.md)).
+
 ## How fast is it?
 
 We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
@@ -210,3 +223,58 @@ parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md
 Strata is free and open source. If it is useful to you, you can support its development:
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+
+---
+
+## RDNA3 / gfx1100 port status (this fork)
+
+Upstream's AMD numbers above are RDNA4 (RX 9070 XT, gfx1201). This fork maintains and measures the
+RDNA3 (gfx1100) path on a Radeon RX 7900 XTX (24 GB): a reproducible CUDA→HIP pipeline with a
+declared patch table, a kernel suite verified on the card against independent references (all ten
+IQ quantization formats bit-exact), and measured production serving of Qwen3.8-Flash-Next IQ3_S.
+
+This line is refreshed onto upstream **0.1.40** (2026-10-06). Upstream 0.1.40 now ships its own
+gfx11 matrix-core arms under the same opt-in keys this fork proposed (`STRATA_HIP_WMMA=1` prompt
+attention, `STRATA_SELECT_WMMA=1` select scorer) and its own gfx11 fused-native-expert arm, plus
+the gfx1100 hipBLASLt-100500 table (absorbed from this fork's PR #755, byte-identical). The
+0.1.39-line measurements below are the fork's record; **the 0.1.40 re-baseline on this card is
+pending** and this section will be re-measured before any number here is claimed for 0.1.40.
+
+Highlights on the 0.1.39 line — decode 56.8–64.2 tok/s across 1K–128K context (flat; GDN attention
+is O(1)); prefill 1,403 tok/s @128K baseline, 1,687 with the gfx1100 hipBLASLt table (**+82%**),
+1,863 with the opt-in RDNA3 prompt-attention WMMA arm (**+22.8%**). Every claim traces to a
+recorded measurement, and the knobs that did not win are recorded too.
+
+Opt-in flags, methodology, the rejected-with-records list and the evidence trail:
+**[GFX1100.md](GFX1100.md)**.
+
+## Using this fork on an RX 7900 XTX
+
+Linux with the `amdgpu` driver (no system ROCm needed), a C++ compiler and git, 64 GB of RAM and
+about 60 GB of disk:
+
+```sh
+git clone https://github.com/xyzzing/Strata && cd Strata
+./setup.sh --backend hip
+```
+
+Setup finds the card (gfx1100), installs ROCm into `.venv` from AMD's TheRock wheels when no system
+ROCm is present (~10 GB, no sudo), compiles the engine for the card (10–20 minutes, once), downloads
+the model and writes a start script. Full details: [docs/AMD_HIP.md](docs/AMD_HIP.md).
+
+The opt-in switches measured on the 0.1.39 line ([GFX1100.md](GFX1100.md) carries the numbers and
+evidence; 0.1.40 re-baseline pending):
+
+| what | how | measured (0.1.39 line) |
+| --- | --- | --- |
+| faster decode | `--spec 3` with `--spec-min-p 0.70` | +9.5% |
+| faster prefill | `STRATA_HIP_WMMA=1`, `STRATA_SELECT_WMMA=1` (0.1.40: upstream's own gfx11 arms) | +22.8% / +8.7% @128K |
+| tuned dense prefill | a hipBLASLt table matching your hipBLASLt version engages on its own (100500 table now ships upstream) | up to +82% @128K |
+
+One tool from the 0.1.39 line is **deferred on this line**: on-device autotuning (upstream
+[PR #744](https://github.com/Niko1221/Strata/pull/744)) — upstream 0.1.40 rewrote the decode-expert
+kernels it tunes, so the port needs a re-base before it can be offered here again.
+
+What to expect (0.1.39 line): decode 57–64 tok/s from 1K to 128K context, prefill ~1.4K → ~1.9K
+tok/s @128K as the switches go on — warm-state (a cold serve climbs ~35% to these values as the
+page cache warms). One machine so far: a datapoint, not a benchmark.
