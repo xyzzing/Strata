@@ -254,7 +254,14 @@ int main() {
     }
     std::printf("INT8-Q vs hilo incumbent: softmax max weight delta %.3e, output max |delta| %.3e\n",
                 wd_add, out_add);
-    const bool ok = iso_rms <= 5e-2 && wd_add <= 2e-2 && out_add <= 2e-2;
+    const bool broken_reference = wd_add == 0.0;   // tripwire: bit-zero max softmax delta over 64x16
+    // elements cannot happen between two independent error classes (int8 quant vs fp16-hilo) - it
+    // means the reference is aliased or degenerate (the k_deq-aliasing lesson: a "pass" this clean
+    // is a broken comparison, verify before believing)
+    if (broken_reference)
+        std::printf("BROKEN-REFERENCE tripwire: vs-hilo deltas are bit-zero - the comparison is "
+                    "degenerate; any verdict from this run is invalid\n");
+    const bool ok = !broken_reference && iso_rms <= 5e-2 && wd_add <= 2e-2 && out_add <= 2e-2;
     std::printf(ok ? "FIXTURE PASS (bounds 5e-2 / 2e-2 / 2e-2)\n" : "FIXTURE FAIL\n");
 
     cudaFree(d_q); cudaFree(d_k); cudaFree(d_qs); cudaFree(d_ks); cudaFree(d_out);
