@@ -14,9 +14,9 @@ large, smart AI model that usually needs a server. It chats, writes code, reads 
 and coding agents. Nothing leaves your PC.
 
 > **This fork adds RDNA3:** a working HIP port for gfx1100 (Radeon RX 7900 XT/XTX/GRE) — the AMD numbers above
-> are RDNA4 (RX 9070 XT); here the same engine is parity-tested and measured on a 7900 XTX: decode 57–64 tok/s
-> from 1K to 128K context, prefill up to ~1.9K tok/s @128K with the opt-in tensor-core arms (0.1.39-line
-> measurements; the 0.1.40 re-baseline is pending — see [GFX1100.md](GFX1100.md)). Numbers, flags and
+> are RDNA4 (RX 9070 XT); here the same engine is parity-tested and measured on a 7900 XTX: decode up to ~80 tok/s
+> (1K context; flat in context) and prefill ~2.1K tok/s @128K with the measured opt-ins (see
+> [GFX1100.md](GFX1100.md) for the settings and the evidence). Numbers, flags and
 > evidence: **[GFX1100.md](GFX1100.md)** · port thread
 > [Niko1221/Strata#106](https://github.com/Niko1221/Strata/issues/106)
 >
@@ -275,6 +275,6 @@ One tool from the 0.1.39 line is **deferred on this line**: on-device autotuning
 [PR #744](https://github.com/Niko1221/Strata/pull/744)) — upstream 0.1.40 rewrote the decode-expert
 kernels it tunes, so the port needs a re-base before it can be offered here again.
 
-What to expect (0.1.39 line): decode 57–64 tok/s from 1K to 128K context, prefill ~1.4K → ~1.9K
-tok/s @128K as the switches go on — warm-state (a cold serve climbs ~35% to these values as the
+What to expect (0.1.40 line, adopted settings): decode ~80 tok/s at 1K context (flat in
+context), prefill ~2.1K tok/s @128K — warm-state (a cold serve climbs ~35% to these values as the
 page cache warms). One machine so far: a datapoint, not a benchmark.
