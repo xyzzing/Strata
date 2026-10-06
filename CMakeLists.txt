@@ -1466,9 +1466,16 @@ endif()
   # HIP-only (rocwmma): outside a GPU backend the .cu target has no linker language and
   # configure fails (the fork CI's CPU job, run 37380884285)
   if(STRATA_ENABLE_HIP)
+    # 0.1.40 scope change: _strata_gg is set inside the CUDA / HIP-tests blocks only, so resolve
+    # the ggml path here (the HIP branch's own rule)
+    if(STRATA_GGML_DIR)
+      set(_strata_fiw_gg "${STRATA_GGML_DIR}/ggml")
+    else()
+      set(_strata_fiw_gg "${strata_llamacpp_SOURCE_DIR}/ggml")
+    endif()
     add_executable(prefill_fused_iq_wmma_test tests/hip/prefill_fused_iq_wmma.cu)
     target_include_directories(prefill_fused_iq_wmma_test PRIVATE ${_strata_gpu_include_directories}
-                              ${_strata_gg}/include ${_strata_gg}/src ${_strata_gg}/src/ggml-cuda
+                              ${_strata_fiw_gg}/include ${_strata_fiw_gg}/src ${_strata_fiw_gg}/src/ggml-cuda
                               ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill)
     target_compile_definitions(prefill_fused_iq_wmma_test PRIVATE GGML_USE_HIP=1)
     target_link_libraries(prefill_fused_iq_wmma_test PRIVATE strata_mmq ${_strata_gpu_runtime_target})
