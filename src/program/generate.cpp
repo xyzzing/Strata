@@ -747,6 +747,7 @@ struct Options {
     /// the batched path)
     int64_t short_read = 64;
     bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
+    bool short_read_given = false;   ///< --short-read N given: the limit is fixed; unset, it follows the measured two-path costs (ShortReadCost)
     /// --pipeline-windows N (--serve, a layer split on exactly two GPUs; opt-in): 1 = a prompt's short reads through
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
     /// 2 = the decode windows too: stage 0 runs window K+1 speculatively while stage 1 verifies window K (rolled back
@@ -907,7 +908,8 @@ void usage() {
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
-                 "                       of the batched prompt path (default 64, 0 = off)\n"
+                 "                       of the batched prompt path (unset: the limit follows what the two paths cost\n"
+                 "                       on this machine, from 64; 0 = off)\n"
                  "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
                  "                       then release prompt buffers and reload it before decode\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
@@ -2162,6 +2164,90 @@ struct PcieAuto {
 
 }  // namespace
 
+// gfx1100 port (2026-10-12) of XeStrata's measured short-read chooser (their b8a83451 + e76a2d7d): upstream's
+// fixed --short-read limit (64) fits no GPU — the windows' per-token cost ranges 6.5-16 ms across cards while the
+// batched path is ~135-150 ms + 3.5-5 ms a token, so the windows pay up to ~50 tokens on the B70 and ~20 on the
+// other two.  No constant fits every card: the serve loop measures both paths as it reads and picks the cheaper
+// one per part.
+struct ShortReadCost {
+    // Both paths' costs grow with where the read starts (the attention over the context before it), so a reading is
+    // kept with its position and a prediction uses only those within a factor of 2 of it: on the RTX 4070 at 64K a
+    // 20-token batched read took 357 ms against 240 ms through the windows, where at 1K it was the faster one.
+    struct Win { double ms_tok; int64_t pos; };
+    struct Bat { int64_t tokens; double ms; int64_t pos; };
+    std::vector<Win> win_ms_tok;                          ///< the last window reads, ms a token
+    std::vector<Bat> batched;                             ///< the last batched reads (ms with lend and refill)
+    bool win_seen = false, batched_seen = false;          ///< each path's first read (JIT, first uploads) is left out
+    int64_t said = -1;                                    ///< the limit last written to the log
+    static constexpr size_t kKeep = 32;
+    static constexpr int64_t kMaxShort = 1024;            ///< longer reads say nothing about the fixed part
+    static constexpr int64_t kMaxWindows = 256;           ///< the windows never take a longer part
+    static constexpr int kTrust = 3;                      ///< reads of each path before they decide
+    static constexpr double kExploreMs = 100;             ///< a part the windows would take this long is tried batched
+    /// ... while the read starts this early: at 64K a batched try of 20-27 tokens took 470-505 ms against 300 ms
+    /// through the windows on the RTX 4070 (2026-10-11), and each try is a request that waits longer
+    static constexpr int64_t kExploreUpTo = 16384;
+
+    static bool near(int64_t a, int64_t b) { return a <= 2 * std::max<int64_t>(b, 1) && b <= 2 * std::max<int64_t>(a, 1); }
+    void add_windows(int64_t tokens, double ms, int64_t pos) {
+        if (tokens <= 0) return;
+        if (!win_seen) { win_seen = true; return; }
+        win_ms_tok.push_back({ms / (double) tokens, pos});
+        if (win_ms_tok.size() > kKeep) win_ms_tok.erase(win_ms_tok.begin());
+    }
+    void add_batched(int64_t tokens, double ms, int64_t pos) {
+        if (tokens <= 0 || tokens > kMaxShort) return;
+        if (!batched_seen) { batched_seen = true; return; }
+        batched.push_back({tokens, ms, pos});
+        if (batched.size() > kKeep) batched.erase(batched.begin());
+    }
+    /// a window token's ms near `pos`: the median of the recent reads there (-1 before kTrust of them)
+    double window_ms(int64_t pos) const {
+        std::vector<double> v;
+        for (const Win& w : win_ms_tok)
+            if (near(w.pos, pos)) v.push_back(w.ms_tok);
+        if ((int) v.size() < kTrust) return -1;
+        std::nth_element(v.begin(), v.begin() + (long) v.size() / 2, v.end());
+        return v[v.size() / 2];
+    }
+    int batched_near(int64_t pos) const {
+        return (int) std::count_if(batched.begin(), batched.end(), [&](const Bat& x) { return near(x.pos, pos); });
+    }
+    /// the batched path's ms for `tokens` near `pos`: a least-squares line through the recent reads there (flat with
+    /// one length only)
+    double batched_ms(int64_t tokens, int64_t pos) const {
+        double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (const Bat& x : batched) {
+            if (!near(x.pos, pos)) continue;
+            const double k = (double) x.tokens;
+            n += 1; sx += k; sy += x.ms; sxx += k * k; sxy += k * x.ms;
+        }
+        if (n == 0) return 0.0;
+        const double den = n * sxx - sx * sx;
+        double slope = den > 1e-9 ? (n * sxy - sx * sy) / den : 0.0;
+        slope = std::max(slope, 0.0);
+        const double fixed = std::max((sy - slope * sx) / n, 0.0);
+        return fixed + slope * (double) tokens;
+    }
+    /// whether `tokens` fresh text tokens from `pos` go through the windows; `limit` is --short-read (or its default)
+    bool windows(int64_t tokens, int64_t limit, bool given, int64_t pos) const {
+        const double w = window_ms(pos);
+        if (given || w < 0) return tokens <= limit;
+        if (tokens > kMaxWindows) return false;
+        if (batched_near(pos) < kTrust)
+            return pos <= kExploreUpTo && w * (double) tokens >= kExploreMs ? false : tokens <= limit;
+        return w * (double) tokens <= batched_ms(tokens, pos);
+    }
+    /// the longest part the windows take now near `pos` (for the log), or -1 before both paths are measured there
+    int64_t limit_now(int64_t pos) const {
+        const double w = window_ms(pos);
+        if (w < 0 || batched_near(pos) < kTrust) return -1;
+        int64_t k = 0;
+        while (k < kMaxWindows && w * (double) (k + 1) <= batched_ms(k + 1, pos)) ++k;
+        return k;
+    }
+};
+
 // #1425 #1549 #1629: --ple-io direct (the default) does unbuffered random reads of the n-gram table; on some drives
 // (DRAM-less NVMe, Windows unbuffered I/O) they run at 34 MB/s or 4-8 tok/s and a prompt reads layer 1 for minutes.
 // Rows per second of a short cold probe: a few batches of random rows through the same batched reader a prompt chunk
@@ -2526,7 +2612,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
-        else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--short-read") { o.short_read = std::max(0LL, std::atoll(next("--short-read"))); o.short_read_given = true; }
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -10554,6 +10640,7 @@ int main(int argc, char** argv) {
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
+        ShortReadCost sr_cost;   // which way a short part of a prompt is read (see ShortReadCost); gfx1100 port of XeStrata's measured chooser
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
@@ -12399,7 +12486,11 @@ int main(int argc, char** argv) {
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > req_short_read) return false;
+                if (no_short) return false;
+                // gfx1100 port: with --short-read unset, the limit follows the two paths' measured costs here;
+                // a per-request override (STRATA_PIPELINE_SWITCH's short_read=) or --short-read N pins it
+                if (!sr_cost.windows(b - a, req_short_read, o.short_read_given || req_short_read != o.short_read, a))
+                    return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -13387,10 +13478,13 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+            int64_t bat_tokens = 0;   // this request's batched parts, for sr_cost: their tokens and ms (lend, refill)
+            double bat_ms = 0;
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
+                const auto tpart = Clock::now();
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -13409,6 +13503,16 @@ int main(int argc, char** argv) {
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
                 if (sp_ok) pp_exact = true;
+                {
+                    const auto now = Clock::now();
+                    if (win) {   // a refill before the windows is the batched part's
+                        bat_ms += std::chrono::duration<double, std::milli>(tsp - tpart).count();
+                        if (sp_ok) sr_cost.add_windows(to - at, std::chrono::duration<double, std::milli>(now - tsp).count(), at);
+                    } else {
+                        bat_tokens += to - at;
+                        bat_ms += std::chrono::duration<double, std::milli>(now - tpart).count();
+                    }
+                }
                 if (trace) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
                     (win ? req_times.windows_ms : req_times.read_ms) += ms;
@@ -13457,6 +13561,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
+            const auto tref = Clock::now();
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
@@ -13477,6 +13582,21 @@ int main(int argc, char** argv) {
                 }
                 std::fprintf(stderr, "strata serve: --prefill-head-alias: output head restored in %.1f ms before decode\n",
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
+            }
+            if (bat_tokens > 0 && !cancelled) {
+                sr_cost.add_batched(bat_tokens,
+                                    bat_ms + std::chrono::duration<double, std::milli>(Clock::now() - tref).count(),
+                                    read_from);
+            }
+            if (!o.short_read_given) {
+                const int64_t lim = sr_cost.limit_now(read_from);
+                if (lim >= 0 && (sr_cost.said < 0 || std::llabs(lim - sr_cost.said) * 4 > std::max<int64_t>(sr_cost.said, 4))) {
+                    std::fprintf(stderr, "strata serve: short reads go through the verify windows up to %lld tokens (a "
+                                 "window token %.1f ms, a batched read %.0f ms + %.1f ms a token)\n", (long long) lim,
+                                 sr_cost.window_ms(read_from), sr_cost.batched_ms(0, read_from),
+                                 sr_cost.batched_ms(1, read_from) - sr_cost.batched_ms(0, read_from));
+                    sr_cost.said = lim;
+                }
             }
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
