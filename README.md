@@ -14,10 +14,11 @@ large, smart AI model that usually needs a server. It chats, writes code, reads 
 and coding agents. Nothing leaves your PC.
 
 > **This fork adds RDNA3:** a working HIP port for gfx1100 (Radeon RX 7900 XT/XTX/GRE) — the AMD numbers above
-> are RDNA4 (RX 9070 XT); here the same engine is parity-tested and measured on a 7900 XTX: decode up to ~80 tok/s
-> (1K context; flat in context) and prefill ~2.1K tok/s @128K with the measured opt-ins (see
-> [GFX1100.md](GFX1100.md) for the settings and the evidence). Numbers, flags and
-> evidence: **[GFX1100.md](GFX1100.md)** · port thread
+> are RDNA4 (RX 9070 XT); here the same engine is parity-tested and measured on a 7900 XTX: decode **102–142 tok/s
+> at 1K context** (the drafter's two trajectories), ~73 at 32K, 52–60 at 128K and 44–45 at 262K, with prefill
+> **~2.3–2.4K tok/s** at 32K/128K on the `0.1.45` line and the adopted opt-ins (`STRATA_ROUTE_PRIOR=0.5`,
+> `STRATA_GDN_CHUNKED=1`, `STRATA_PF_GEMM=1`, `STRATA_PF_PAD=1`). Numbers, flags and
+> evidence: **[GFX1100.md](GFX1100.md)** and the recorded windows in [artifacts/rocm](artifacts/rocm/README.md) · port thread
 > [Niko1221/Strata#106](https://github.com/Niko1221/Strata/issues/106)
 >
 > **How this was made:** the port, its verification campaigns and these docs were produced by an AI engineering
@@ -264,17 +265,19 @@ RDNA3 (gfx1100) path on a Radeon RX 7900 XTX (24 GB): a reproducible CUDA→HIP 
 declared patch table, a kernel suite verified on the card against independent references (all ten
 IQ quantization formats bit-exact), and measured production serving of Qwen3.8-Flash-Next IQ3_S.
 
-This line is refreshed onto upstream **0.1.40** (2026-10-06). Upstream 0.1.40 now ships its own
-gfx11 matrix-core arms under the same opt-in keys this fork proposed (`STRATA_HIP_WMMA=1` prompt
-attention, `STRATA_SELECT_WMMA=1` select scorer) and its own gfx11 fused-native-expert arm, plus
-the gfx1100 hipBLASLt-100500 table (absorbed from this fork's PR #755, byte-identical). The
-0.1.39-line measurements below are the fork's record; **the 0.1.40 re-baseline on this card is
-pending** and this section will be re-measured before any number here is claimed for 0.1.40.
+This line is refreshed onto upstream **0.1.45** (2026-10-16) and re-baselined on this card on
+2026-10-18. Upstream 0.1.40 already ships its own gfx11 matrix-core arms under the same opt-in keys
+this fork proposed (`STRATA_HIP_WMMA=1` prompt attention, `STRATA_SELECT_WMMA=1` select scorer) and
+its own gfx11 fused-native-expert arm, plus the gfx1100 hipBLASLt-100500 table (absorbed from this
+fork's PR #755, byte-identical). The 0.1.39-line numbers that remain below are marked as such; the
+live-env re-baseline on 0.1.45 is recorded in [GFX1100.md](GFX1100.md).
 
-Highlights on the 0.1.39 line — decode 56.8–64.2 tok/s across 1K–128K context (flat; GDN attention
-is O(1)); prefill 1,403 tok/s @128K baseline, 1,687 with the gfx1100 hipBLASLt table (**+82%**),
-1,863 with the opt-in RDNA3 prompt-attention WMMA arm (**+22.8%**). Every claim traces to a
-recorded measurement, and the knobs that did not win are recorded too.
+Highlights on the `0.1.45` line (live-env re-baseline, 2026-10-18): decode **102–142 tok/s at 1K**
+(the drafter's two trajectories: 100% acceptance ≈ 140, 200/200 ≈ 102), **~73 at 32K**, **52–60 at
+128K**, **44–45 at 262K**; prefill **2,337–2,421 tok/s at 32K/128K** and **2,315 at 262K**. The
+adopted opt-ins moved the window itself: `STRATA_ROUTE_PRIOR=0.5` cut per-layer CPU experts
+1.55–2.63 → 0.93 and the wait for rings 9.45 → 3.02 ms. Every claim traces to a recorded
+measurement, and the knobs that did not win are recorded too.
 
 Opt-in flags, methodology, the rejected-with-records list and the evidence trail:
 **[GFX1100.md](GFX1100.md)**.
@@ -293,19 +296,24 @@ Setup finds the card (gfx1100), installs ROCm into `.venv` from AMD's TheRock wh
 ROCm is present (~10 GB, no sudo), compiles the engine for the card (10–20 minutes, once), downloads
 the model and writes a start script. Full details: [docs/AMD_HIP.md](docs/AMD_HIP.md).
 
-The opt-in switches measured on the 0.1.39 line ([GFX1100.md](GFX1100.md) carries the numbers and
-evidence; 0.1.40 re-baseline pending):
+The opt-in switches measured on the 0.1.45 line ([GFX1100.md](GFX1100.md) carries the numbers and
+evidence):
 
-| what | how | measured (0.1.39 line) |
+| what | how | measured (0.1.45 line) |
 | --- | --- | --- |
-| faster decode | `--spec 3` with `--spec-min-p 0.70` | +9.5% |
-| faster prefill | `STRATA_HIP_WMMA=1`, `STRATA_SELECT_WMMA=1` (0.1.40: upstream's own gfx11 arms) | +22.8% / +8.7% @128K |
-| tuned dense prefill | a hipBLASLt table matching your hipBLASLt version engages on its own (100500 table now ships upstream) | up to +82% @128K |
+| faster decode | `STRATA_ROUTE_PRIOR=0.5` | +22.2% @1K (5/5), +25.6% @32K (2/2), +27.8% @262K (3/3) |
+| faster prefill @32K | `STRATA_GDN_CHUNKED=1` | +5.9% |
+| faster prefill @128K | `STRATA_PF_GEMM=1`, `STRATA_PF_PAD=1` | +4.4% |
+| spec width | `--spec 3` with `--spec-min-p 0.70` | +9.5% (0.1.39 line, still used) |
+| gfx11 matrix arms | `STRATA_HIP_WMMA=1`, `STRATA_SELECT_WMMA=1` | +22.8% / +8.7% @128K (0.1.39 line, still used) |
+| tuned dense prefill | a hipBLASLt table matching your hipBLASLt version engages on its own (100500 table now ships upstream) | up to +82% @128K (0.1.39 line) |
 
 One tool from the 0.1.39 line is **deferred on this line**: on-device autotuning (upstream
 [PR #744](https://github.com/Niko1221/Strata/pull/744)) — upstream 0.1.40 rewrote the decode-expert
 kernels it tunes, so the port needs a re-base before it can be offered here again.
 
-What to expect (0.1.40 line, adopted settings): decode ~80 tok/s at 1K context (flat in
-context), prefill ~2.1K tok/s @128K — warm-state (a cold serve climbs ~35% to these values as the
-page cache warms). One machine so far: a datapoint, not a benchmark.
+What to expect (0.1.45 line, adopted settings, warm state): decode **102–142 tok/s at 1K**
+(trajectory-dependent — the drafter either accepts at 100% or runs the 200/200 path), **~73 at 32K**,
+**52–60 at 128K**, **44–45 at 262K**; prefill **~2.3–2.4K tok/s @32K/128K**, 2,315 @262K. A cold
+serve climbs to these values as the page cache warms. One machine so far: a datapoint, not a
+benchmark.
