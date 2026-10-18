@@ -1,0 +1,62 @@
+{
+  "id": "record-iq3s-window-d-defer-cpu-20261018",
+  "what": "STRATA_VERIFY_DEFER_CPU (#2690) ported onto refresh-0145 and gated on quality + paired decode on gfx1100",
+  "date": "2026-10-18",
+  "port": {
+    "worktree": "/home/zacch/projects/strata-r146 (branch port-2690)",
+    "commit": "3f04756b - merge of refs/tmp/pr2690 (PR branch based on v0.1.44.1) into refresh-0145 (ed3606a6)",
+    "conflicts_resolved": {
+      "include/strata/core/expert_source.hpp": "kept the fork's PcieModel; added the PR's plan-sink weights/heavy/partial fields",
+      "src/core/verify.cpp": "kept hflag_in_h_ (overlapped split), herr_h_/hdrop_h_/h_bal_ handles and their resets, added h_pflag_ to all four; batch_poll keeps upstream's lb_+k (the PR base had b_k_) plus the sink nulls",
+      "docs/DETAILS.md": "kept both the fork's PCIE_BALANCE fragment and the PR's new section"
+    },
+    "auto_merged": ["include/strata/core/peer_experts.hpp", "include/strata/core/verify.hpp", "include/strata/kernels/verify_kernels.hpp", "src/core/expert_source.cpp", "src/core/peer_experts.cpp", "src/kernels/cuda/verify_kernels.cu", "src/program/generate.cpp"],
+    "build": "strata-r146/build-0146, full build green (309 targets); binary sha256 d2080793b7391076ddcbe3e4969e03ac000b1d48639266e21b1f8a6563629233; STRATA_VERSION 0.1.45-ed3606a6-dirty (configured while the merge was uncommitted - the commit is the provenance)",
+    "composition_notes": "TAIL_SKIP skipped rows are zeros (expert_source.cpp); the deferred combine keeps the PCIe share's grouped launch (PcieAuto); late_add uses the pending write's inj2_/Rt(tb) arithmetic; set_pool_gpu_helper is called from generate.cpp so the heavy split is off for peer/helper GPUs"
+  },
+  "window": {
+    "script": "scripts/rocm/r30d-defer-cpu-window.sh",
+    "stamp": "20261018T103819Z",
+    "run1": "an earlier run (20261018T103547Z) completed Gate A and failed before Gate B on a bash local-scope bug in cell(); its A-B-A artifacts are kept and quoted below where they differ",
+    "gates": "VRAM <= 2600 before cells; 8081 restored healthy after ~24 s"
+  },
+  "parity": {
+    "result": "4/4 PASS on build-0146 (default path): iq_parity, native_grouped_parity, iq_multi_parity, qsa_select_wmma_parity"
+  },
+  "quality": {
+    "battery_AB_A": {"base": "7/8", "defer": "7/8", "base_again": "7/8", "regressions": "none",
+                     "note": "h2o fails in every arm because the answer is the subscript H2O and the battery regex expects ascii h2o - a battery artifact, identical across arms"},
+    "battery_answers": "identical text in every arm (Paris, 391, Jupiter, 1989, 17, Iron, H2O, 7)",
+    "prose_drift": {
+      "run1": {"arm_vs_base": 0.000, "restart_floor_base_vs_base_again": 0.748},
+      "run2": {"arm_vs_base": 0.734, "restart_floor_base_vs_base_again": 0.000},
+      "reading": "the cross-restart greedy divergence is itself unstable (0.748 then 0.000), so the prose-drift metric is noise-dominated; run 2 shows the deferral does change the prose (as declared), run 1 showed no change for the short sample"
+    },
+    "engagement": "verified: every captured window printed ', deferred' (1/2/3/5/6/8-token windows) and the start-up lines named the 0.1 heavy threshold"
+  },
+  "performance": {
+    "1k": {"base": [96.29, 91.42, 96.18, 96.11, 78.80], "defer": [82.94, 84.95, 85.07, 85.14, 83.94],
+           "d_tps_pct": [-13.86, -7.08, -11.55, -11.41, 6.52], "median_pct": -11.41, "wins": "1/5",
+           "ms_per_round_pct": [0.12, -8.86, -4.25, -4.41, 9.95],
+           "acceptance": {"base": [162, 162, 162, 162, 127], "defer": [147, 146, 146, 146, 146]}},
+    "32k": {"base": [61.52, 66.93], "defer": [62.54, 61.04], "d_tps_pct": [1.66, -8.80], "median_pct": -3.57, "wins": "1/2",
+            "ms_per_round_pct": [-15.49, -5.79],
+            "acceptance": {"base": [70, 70], "defer": [57, 57]}},
+    "128k": {"base": [64.92, 65.06], "defer": [62.67, 62.62], "d_tps_pct": [-3.47, -3.75], "median_pct": -3.61, "wins": "0/2",
+             "ms_per_round_pct": [3.60, 3.88],
+             "acceptance": {"base": [36, 36], "defer": [36, 36]}}
+  },
+  "verdict": {
+    "gates": "quality A1 PASS (battery), A2 inconclusive/noise-dominated; performance 1K FAIL, 32K FAIL, 128K FAIL",
+    "result": "NOT ADOPTED - production stays on build-0145 (exe unchanged, no STRATA_VERIFY_DEFER_CPU in the config), verified healthy after the window",
+    "interpretation": "the overlap is real at depth (32K ms/round -15.5%/-5.8%) but the output change costs drafter acceptance, so committed tok/s falls at every tier (1K 162 -> 146 accepted); at 1K both the round and the acceptance are worse",
+    "possible_follow_up": "a bounded STRATA_VERIFY_DEFER_CPU_BELOW sweep (e.g. 0.05/0.02) would trade output divergence for acceptance, but the sign is negative at two tiers and the default 0.1 is upstream's own; not run (declared, not queued as an adoption candidate)",
+    "disposition": "the port stays on branch port-2690 / worktree strata-r146 as a dormant, documented experiment; not merged into refresh-0145, not in production"
+  },
+  "logs": [
+    "artifacts/rocm/logs/r30d-defer-window-20261018T103819Z.log",
+    "artifacts/rocm/logs/r30d-defer-window-20261018T103547Z.log",
+    "artifacts/rocm/logs/r30d-cell-*-20261018T103819Z.log",
+    "artifacts/rocm/logs/r30d-engine-*-20261018T103819Z.log"
+  ]
+}

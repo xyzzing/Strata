@@ -1,0 +1,22 @@
+{
+  "id": "record-iq3s-262k-line-ab-20261018",
+  "what": "item 1: is the 262K decode drop 0.1.43.1 -> 0.1.45 real? Same workload, args and env, both binaries",
+  "date": "2026-10-18",
+  "window": {"script": "scripts/rocm/r30e-262k-line-ab.sh", "stamp": "20261018T130725Z",
+             "gates": "MemAvailable 69,297 MiB; VRAM 2,214 MiB; 8081 restored healthy after ~24 s"},
+  "binaries": {"A": "/home/zacch/projects/strata-r143/build-0143/strata (0.1.43.1-8a15c99c)",
+               "B": "/home/zacch/projects/strata-r145/build-0145/strata (0.1.45-8eb3e85d)"},
+  "workload": "261,888-token prompt, --max-context 262144, 64 new tokens; production env (SELECT_WMMA, HIP_WMMA, SH_STREAM, TAIL_SKIP=7, lookup-chain 2, spec 5, kv-resident 32768, prefill 8192)",
+  "pairs": [
+    {"a_tps": 55.13, "b_tps": 56.62, "d_tps_pct": 2.70, "a_ms_round": 38.70, "b_ms_round": 37.68, "d_msr_pct": -2.64, "a_prefill": 2073.7, "b_prefill": 2134.9},
+    {"a_tps": 54.57, "b_tps": 56.73, "d_tps_pct": 3.96, "a_ms_round": 39.09, "b_ms_round": 37.60, "d_msr_pct": -3.80, "a_prefill": 2065.6, "b_prefill": 2131.8},
+    {"a_tps": 39.58, "b_tps": 55.06, "d_tps_pct": 39.11, "a_ms_round": 53.90, "b_ms_round": 38.75, "d_msr_pct": -28.11, "a_prefill": 2020.6, "b_prefill": 2097.1,
+     "note": "the 0143 cell is a stall/outlier (ms/round 53.9 vs 38.7-39.1 in the other pairs); excluded from the reading, kept in the record"}
+  ],
+  "median": {"d_tps_pct": 3.96, "d_msr_pct": -3.80, "note": "median over the three pairs as run; the two clean pairs are +2.70% and +3.96%"},
+  "prefill": {"deltas_pct": [2.95, 3.20, 3.79], "reading": "0.1.45 is also ~3% faster in prefill on the same config"},
+  "decode_summary_pair1": {"0143": "wait 23.842 pool 6.387 pcie 2.6, accepted 34/41", "0145": "wait 22.821 pool 6.301 pcie 2.57, accepted 34/40"},
+  "reading": "0.1.45 is FASTER at 262K on the same config (+3.96% median decode, +3% prefill). The 69.3-vs-56.5 gap is CONFIG/METHODOLOGY, not a line regression: the R1292 sweep config differs (its 69.3 cannot be reproduced on 0.1.43.1 with the current production env and a 64-token cell).",
+  "disposition": "the suspected deep-tier regression is CLOSED as config-dependent; the ledger's 262K row should quote 56.5 tok/s for this config and stop citing 69.3 as a like-for-like prior. No adoption, production untouched.",
+  "logs": ["artifacts/rocm/logs/r30e-262k-line-20261018T130725Z.log", "artifacts/rocm/logs/r30e-cell-*-20261018T130725Z.log"]
+}

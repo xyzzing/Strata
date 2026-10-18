@@ -1,0 +1,33 @@
+{
+  "id": "record-iq3s-window-prefill-20261018",
+  "what": "item 5: prefill cells - exact-scorer three-way, GDN chunked, PF_GEMM/PF_PAD isolate; gate and adoption",
+  "date": "2026-10-18",
+  "window": {"script": "scripts/rocm/r30h-prefill-cells.sh", "stamp": "20261018T141401Z",
+             "binary": "build-0145 (0.1.45-8eb3e85d)",
+             "resource_note": "the 68,000 MiB gate was unreachable after the desktop baseline grew (two attempts at 67.2-67.7k); the cell cap was lowered 66G -> 64G and the gate to 66,000 MiB with the reason recorded in the script header"},
+  "scorer_three_way_128k": {
+    "A_current_fp16_wmma": {"prefill_tps": [2041.5, 2091.3], "select_ms": [1714, 1715]},
+    "B_exact_thread": {"prefill_tps": [2065.6, 2044.1], "select_ms": [4320, 4374]},
+    "C_ref_radix": {"prefill_tps": [1875.9, 1846.8], "select_ms": [9859, 10440]},
+    "verdict": "the fp16 arm is the fastest scorer (select 1.71 s vs 4.32 s exact and ~10 s radix); B vs A total prefill -0.56% (tie); #1298 closes with this data"
+  },
+  "gdn_chunked_32k": {"base_tps": [2120.8, 2108.8], "chunked_tps": [2252.8, 2224.1], "delta_pct": [6.22, 5.47], "median_pct": 5.85,
+                       "verdict": "above the +3% gate; output-changing (FP16 operands) -> gated"},
+  "pf_isolate_128k": {"default_tps": [2110.3, 2111.4], "pf_gemm_tps": [2163.9, 2166.0], "median_pct": 2.56,
+                      "pf_gemm_pad_tps": [2214.9, 2192.9], "pad_vs_default_pct": 4.41,
+                      "verdict": "PF_GEMM alone +2.56% (below the +3% gate); +PF_PAD +4.41% (passes); PAD is output-changing -> gated"},
+  "gate": {
+    "script": "scripts/rocm/r30j-prefill-gate.sh",
+    "parity": "hip_gdn_chunked PASS on card; iq_parity PASS",
+    "needle": "8K-token prompt with the code 739154 at its middle, greedy, thinking off: base1 PASS (8 s), GDN PASS (7 s), PF PASS (7 s), base2 PASS (7 s), answer identical in all four",
+    "why_not_the_short_battery": "both changes are prefill-only and their paths need a prompt chunk far larger than the 8-prompt battery's inputs, so the battery would never execute them; the declared gate is the parity test + the 8K needle"
+  },
+  "adoption": {
+    "config": "serve-8081.json env += STRATA_GDN_CHUNKED=1, STRATA_PF_GEMM=1, STRATA_PF_PAD=1 (with STRATA_ROUTE_PRIOR=0.5 already live)",
+    "backup": "serve-8081.json.bak-prefill-pre",
+    "restart": "health ok after ~24 s; Paris smoke stop",
+    "rollback": "restore .bak-prefill-pre and restart; unsetting the three envs restores base prefill",
+    "binary": "unchanged (build-0145, 0.1.45-8eb3e85d) - env-only adoption"
+  },
+  "logs": ["artifacts/rocm/logs/r30h-prefill-cells-20261018T141401Z.log", "artifacts/rocm/logs/r30h-cell-*-20261018T141401Z.log", "artifacts/rocm/logs/r30j-prefill-gate-20261018T143735Z.log"]
+}

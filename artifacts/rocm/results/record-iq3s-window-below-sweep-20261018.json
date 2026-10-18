@@ -1,0 +1,19 @@
+{
+  "id": "record-iq3s-window-below-sweep-20261018",
+  "what": "item 3: bounded STRATA_VERIFY_DEFER_CPU_BELOW sweep on top of the live ROUTE_PRIOR=0.5 config",
+  "date": "2026-10-18",
+  "window": {"script": "scripts/rocm/r30g-defer-below-sweep.sh", "stamp": "20261018T135718Z",
+             "binary": "strata-r146/build-0146 (0.1.45-ed3606a6-dirty, the #2690 port)",
+             "arms": "base = live config (ROUTE_PRIOR=0.5, defer off); arm = live + STRATA_VERIFY_DEFER_CPU=1 + BELOW in {0.05, 0.02}"},
+  "screen_1k": {"0.05": "+1.79% median over 3 pairs", "0.02": "-37.53% median"},
+  "chosen": "0.05",
+  "confirmation": {
+    "1k": {"base_tps": [106.45, 123.21, 107.51, 103.50, 107.65, 122.42, 125.54, 125.26], "arm_tps": [125.41, 124.92, 80.59, 114.31, 122.15],
+           "paired_d_tps_pct": [1.79, 20.70, -34.17, -8.95, -2.48], "median_pct": -2.48, "wins": "2/5",
+           "ms_round_pct": [5.27, 10.96, -33.62, 9.82, 2.55],
+           "note": "the base shows the live config's trajectory (123-125 tok/s, 211/212 accepted in the later cells); the arm's median is negative and the rounds are slower"},
+    "32k": {"base_tps": [76.47, 74.21], "arm_tps": [74.54, 70.21], "median_pct": -3.96, "wins": "0/2", "ms_round_pct": [9.91, 13.25]}
+  },
+  "verdict": "NOT ADOPTED - no BELOW value rescues the #2690 deferral on top of the live config; the late-add work and the acceptance change still lose. The deferral stays dormant on port-2690.",
+  "logs": ["artifacts/rocm/logs/r30g-below-20261018T135718Z.log", "artifacts/rocm/logs/r30g-cell-*-20261018T135718Z.log"]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "record-iq3s-hc-fusion-feasibility-20261018",
+  "what": "item 4: gfx11 HC decode fusion - feasibility and go/no-go",
+  "date": "2026-10-18",
+  "question": "The decode stage profile puts the hyper-connection norm/down/up cluster at 5.46 ms/window (15.6%, profile_report). Can a fused gfx11 kernel take it?",
+  "findings": [
+    "The default decode HC read (fused_gr_read_multi, src/kernels/cuda/fused_gr.cu) launches norm, down_split, down_finish and up per half - 4 launches x 2 halves per layer, 48 layers.",
+    "The only fused form in-tree is STRATA_HC_PERSIST (one persistent kernel, gfx1030): it REFUSES gfx11/gfx12 because its barrier timeout needs s_memrealtime, which those parts do not have (fused_gr.cu:2887).",
+    "The same source comment records that upstream measured the persistent form on gfx1030 and 'an R9700 saw no gain from it (#2226)' - i.e. the RDNA-class prior is NEGATIVE even where the barrier exists.",
+    "The 15.6% share is from the instrumented pipeline; STRATA_VERIFY_PROFILE disables sh_fork/branch/fuse_ab/side_mixer and the profiled round is 42.1 ms vs ~27.2 ms uninstrumented, so the uninstrumented HC share is not established."
+  ],
+  "decision": "NO-GO for implementation. Two independent reasons: (a) the one in-tree design needs a gfx11 barrier workaround and the closest measured prior (RDNA4 R9700) showed no gain; (b) the target share is only known from an instrumented pipeline. Days-class effort against an unproven target is not justified while item 5's prefill levers and item 3's bounded sweep are cheaper.",
+  "reopen_triggers": [
+    "an uninstrumented attribution that puts the HC cluster >= 10% of the decode window (e.g. a kernel-level bench of fused_gr_read_multi's launches, not the profiler)",
+    "a barrier-free fusion shape (e.g. fold the norm into the down kernel per block, or overlap down/up on two streams) that does not need a grid barrier",
+    "upstream landing a gfx11 HC fusion with positive RDNA3 numbers"
+  ],
+  "evidence": ["src/kernels/cuda/fused_gr.cu:2192-2330 (launch sequence)", "fused_gr.cu:2880-2900 (the gfx11/gfx12 refusal and the R9700 note)", "record-iq3s-window-b-20261018.json (stage profile + caveat)"]
+}

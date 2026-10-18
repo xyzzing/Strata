@@ -1,0 +1,49 @@
+{
+  "id": "record-iq3s-window-route-prior-20261018",
+  "what": "item 2: STRATA_ROUTE_PRIOR=lambda campaign - screen, quality battery, clean confirmation, ADOPTED 0.5",
+  "date": "2026-10-18",
+  "mechanism": "cache-conditioned routing (route_prior.cu, arXiv 2412.00099 without training): when the router picks the top-10, a resident expert gets a lambda logit bonus; the weights stay the unbiased softmax renormalised over the picks. Output-changing. Requires NE==512, K==10 (this model: yes) and the residency table.",
+  "screen": {
+    "script": "scripts/rocm/r30f-route-prior-campaign.sh",
+    "stamp": "20261018T132333Z",
+    "lambdas": {"0.5": "+29.86% median at 1K (3 pairs)", "1.0": "-3.84%", "2.0": "+0.72%"},
+    "battery_AB_A": {"base": "7/8", "arm_0.5": "7/8", "base_again": "7/8", "regressions": "none"},
+    "verdict_bug": "the screen's verdict script used an inverted ms/round sign (it treated faster rounds as regressions); the raw numbers are kept and were re-read with the correct sign. Fixed in the script."
+  },
+  "confirmation": {
+    "script": "scripts/rocm/r30i-route-prior-confirm.sh",
+    "stamp": "20261018T134348Z",
+    "design": "clean alternation, same binary (build-0145, 0.1.45-8eb3e85d), base = env unset, arm = STRATA_ROUTE_PRIOR=0.5",
+    "1k": {"base_tps": [88.10, 82.18, 86.35, 82.74, 89.56], "arm_tps": [121.33, 107.67, 100.81, 101.11, 106.35],
+           "d_tps_pct": [37.72, 31.02, 16.75, 22.20, 18.75], "median_pct": 22.20, "wins": "5/5",
+           "d_ms_round_pct": [8.93, 0.75, -27.27, 8.02, 1.06], "median_ms_round_pct": 1.06,
+           "accepted": {"base": [168, 160, 168, 160, 168], "arm": [200, 182, 150, 182, 182]}},
+    "32k": {"base_tps": [62.13, 60.51], "arm_tps": [77.21, 76.76], "median_pct": 25.56, "wins": "2/2",
+            "median_ms_round_pct": -9.32, "accepted": {"base": [62, 65], "arm": [71, 69]}},
+    "128k": {"base_tps": [64.29, 64.47], "arm_tps": [64.85, 64.22], "median_pct": 0.24, "wins": "1/2",
+             "median_ms_round_pct": -15.36, "accepted": {"base": [36, 36], "arm": [33, 33]}}
+  },
+  "mechanism_measured": {
+    "cpu_experts_per_layer_1k": "base 1.61-1.70 distinct / 2.40-2.54 routed -> arm 0.44-1.33 / 0.47-1.66",
+    "pcie_experts_per_layer_1k": "base 1.19-1.30 -> arm 0.20-0.89",
+    "cpu_experts_per_layer_32k": "base 1.59-2.03 -> arm 0.69-0.73",
+    "pcie_experts_per_layer_32k": "base 1.15-1.61 -> arm 0.35-0.39",
+    "cpu_experts_per_layer_128k": "base 1.92 -> arm 0.78",
+    "reading": "the prior cuts the CPU/PCIe expert traffic that the campaign measured as the decode wall. At 32K the round is also faster (-9.3%); at 1K the round is neutral (+1.1% median) and the gain is mostly the drafter's acceptance on the new trajectory (0.79 -> 0.94 ratio in the matching cells); at 128K tok/s is neutral while the round is -15.4%."
+  },
+  "adoption": {
+    "config": "/home/zacch/strata-rocm-experiments/20261003-231142/serve-8081.json",
+    "change": "env STRATA_ROUTE_PRIOR=0.5 added; note records OUTPUT-CHANGING and the rollback",
+    "backup": "serve-8081.json.bak-route-prior-pre (one cp away)",
+    "restart": "systemctl --user restart strata-8081; health ok after ~24 s; engine up",
+    "smoke": "Paris, finish stop (thinking disabled)",
+    "rollback": "restore the .bak and restart; unset/=0 also restores the base outputs",
+    "binary": "unchanged (build-0145, 0.1.45-8eb3e85d) - env-only adoption"
+  },
+  "honest_caveats": [
+    "output-changing: quality gated by the rehearsed battery (7/8=7/8, no regressions), not by KL (infeasible on native packs)",
+    "at 1K the gain is mostly acceptance on the new trajectory, not round time; at 32K both improve; at 128K only the round improves",
+    "the batch/parallel workloads were not tested (single-user production)"
+  ],
+  "logs": ["artifacts/rocm/logs/r30f-route-prior-20261018T132333Z.log", "artifacts/rocm/logs/r30i-confirm-20261018T134348Z.log", "artifacts/rocm/logs/r30i-cell-*-20261018T134348Z.log"]
+}

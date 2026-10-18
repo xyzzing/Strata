@@ -1,0 +1,25 @@
+{
+  "id": "record-iq3s-hc-up-window-20261018",
+  "what": "HC up investigation with stop rule: establish the real bytes/efficiency, then test whether a grid/ILP shape reaches a gate-clearing ceiling",
+  "date": "2026-10-18",
+  "byte_calibration": {
+    "engine_bytes": "w_up is bf16 [10240][320] = 6.5536 MB per (layer, half) - the bench's 3.48 MB Q8_0 synthetic was the artifact",
+    "in_situ": "hc0 up 0.76 ms + hc1 up 0.74 ms per window at T=3.17; 96 calls => 15.6 us/call = ~415-420 GB/s = 56% of the 750 GB/s wall",
+    "correction": "the earlier 21-32% was the synthetic-Q8_0 bench; the engine's real efficiency is 56%"
+  },
+  "bench": {
+    "tool": "src/kernels/hc_up_bench.cpp (new diagnostics bench, not in the engine)",
+    "run": "one window, 300 iters, 6.55 MB bf16, 16 copies (105 MB, past LLC)",
+    "variants_gbs": {"V0_baseline_80x128": 182.1, "V1_rows_split_2_160blk": 447.7, "V2_rows_split_4_320blk": 566.2,
+                     "V3_8warps_256th": 461.4, "V4_4row_ILP": 281.7},
+    "best": "V2 (row-split 4) = 11.6 us = 566 GB/s = 75% of the wall"
+  },
+  "bound": {
+    "engine_anchor": "415 GB/s in situ",
+    "wall_ceiling": "at 750 GB/s the 96 calls would take 0.83 ms instead of 1.50 => 0.67 ms saved = 1.9% of the 35 ms round - below the 2% gate even at the wall",
+    "practical": "V2's 566 GB/s => 0.4-0.5 ms saved (1.2-1.4%)",
+    "caveat": "the bench's V0 replica (182 GB/s) is 2.3x slower than the engine's actual multi-token kernel (415), so the bench measures a shape effect, not the engine's exact headroom"
+  },
+  "verdict": "STOPPED by the stop rule: even the theoretical wall (1.9%) cannot clear the pre-declared >=2% gate, and the practical best shape reaches 75% (1.2-1.4%). No engine change was made; the bench is kept as a diagnostic.",
+  "next": "the campaign's remaining small-shape inefficiencies are all below the gate individually; a gate-clearing step needs a multi-call change (or a different objective)"
+}

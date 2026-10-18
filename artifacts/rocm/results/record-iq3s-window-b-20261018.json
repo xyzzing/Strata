@@ -1,0 +1,66 @@
+{
+  "id": "record-iq3s-window-b-20261018",
+  "what": "IQ3_S decode campaign window B: campaign baseline, the down-arm e2e verdict, and the GPU stage profile through the serve path",
+  "date": "2026-10-18",
+  "window": {
+    "script": "scripts/rocm/r30b-iq3s-window.sh",
+    "stamp": "20261018T094550Z",
+    "production": "8081 stopped, restored healthy after ~24 s (trap); engine 0.1.45-8eb3e85d",
+    "gates": "MemAvailable 68021 MiB >= 68000; VRAM 1761 MiB <= 2600"
+  },
+  "baseline_cells": {
+    "config": "production args/env, no timing instrumentation, one-shot, 256/128/64 new tokens",
+    "1k": {"cells": [96.19, 96.16, 96.23, 95.79, 96.09], "median": 96.09, "spread_pct": 0.46,
+            "acceptance": "162 of 166 in every cell"},
+    "32k": {"cells": [66.98, 65.65], "median": 66.32, "spread_pct": 2.0, "acceptance": "70 of 103 in every cell"},
+    "128k": {"cells": [64.83, 58.31], "median": 61.57, "spread_pct": 10.6,
+             "acceptance": "36 of 56 in every cell",
+             "note": "the second cell is a slow trajectory/stall with identical acceptance; 128K absolute cells are noisy, paired arms are the rule"}
+  },
+  "down_arm_e2e": {
+    "config": "STRATA_EXPDEC=1 STRATA_EXPDEC_DOWN=1 STRATA_EXPDEC_D20=1 vs baseline, interleaved",
+    "1k": {"deltas_pct": [-3.34, -4.16, -3.53, -2.90, -3.25], "median": -3.34, "spread": 0.82, "acceptance_identical": true},
+    "32k": {"deltas_pct": [-4.63, -1.08], "median": -2.85, "spread": 1.77, "acceptance_identical": true},
+    "128k": {"deltas_pct": [-2.99, 9.00], "median": 3.01, "spread": 6.0, "acceptance_identical": true,
+             "note": "one slow base cell (58.31) inflates the +9% pair; not a real gain"},
+    "verdict": "REJECTED: the -21..-34% kernel-level down win from the bench does not survive the engine; it is a -3.3% regression at 1K and -2.9% at 32K with identical acceptance. This reproduces docs/EXPERTDEC.md's CUDA observation (bench faster, engine slower) on gfx1100.",
+    "kernel_win_kept_as_evidence": "the G34 T1 down times (-21..-34% on every format) are in record-iq3s-window-a; the dispatch stays default"
+  },
+  "gpu_stage_profile": {
+    "source": "/home/zacch/strata-rocm-experiments/20261003-231142/logs/engine-8081.log (engine stderr; the config's log file, not server.py stdout)",
+    "how": "server.py manually on 8081 with STRATA_DECODE_TIMING=1 STRATA_VERIFY_PROFILE=1, one 2,972-token prompt + 128 new tokens; the request reported 40 windows, avg T 3.85, 3.20 tokens/window, 42.10 ms/window",
+    "instrumentation_caveat": "STRATA_VERIFY_PROFILE=1 disables sh_fork / branch / fuse_ab / side_mixer fusions and adds stage events: the profiled round is 42.1 ms vs ~27.2 ms uninstrumented (96.09 tok/s). Shares are indicative; absolute milliseconds are inflated.",
+    "stage_total_ms_per_window": 35.07,
+    "cluster_shares_ms": {
+      "waitA+B (pipeline waits)": 9.45,
+      "projections + attention (dense/bandwidth-bound)": 8.86,
+      "HC norm/down/up (hc0+hc1, both layer groups)": 5.46,
+      "expert VRAM hits (grouped gate/up+down)": 3.93,
+      "shared+quant": 2.13,
+      "copy+combine+PCIe": 1.87,
+      "router+plan+bell": 1.55,
+      "head": 1.14
+    },
+    "cluster_shares_pct": {
+      "waitA+B": 26.9, "projections+attention": 25.3, "HC": 15.6, "expert_vram_hits": 11.2,
+      "shared_quant": 6.1, "copy_combine_pcie": 5.3, "router_plan": 4.4, "head": 3.3
+    },
+    "outside_stage_total": {"mtp_draft_ms_per_round": 4.77, "pct_of_42.1_round": 11.3},
+    "reading": "the window is GPU-busy, but its largest item is a pipeline WAIT (27%), and the largest true kernel clusters are bandwidth-bound projections (25%) and the HC reads (16%). The grouped expert path (11%) was already tried and rejected at the kernel level (gate/up) and e2e (down)."
+  },
+  "decisions": {
+    "K2": "REJECTED e2e (-3.34% at 1K, -2.85% at 32K); the kernel-level win does not transfer",
+    "K1": "REJECTED at the kernel level in window A",
+    "next": "T08 overlap/scheduling (the 27% wait correlates with the per-layer host CPU-expert serialization: host 5.40 ms/window, CPU experts 2.63 distinct/layer) or a new gfx11 HC fusion kernel (15.6% cluster, no in-binary decode arm: HC_UPMIX is prefill-only, HC_PERSIST refuses gfx11)"
+  },
+  "logs": [
+    "artifacts/rocm/logs/r30b-iq3s-window-20261018T094550Z.log",
+    "artifacts/rocm/logs/r30b-iq3s-attr-20261018T094550Z.log",
+    "artifacts/rocm/logs/r30b-iq3s-cell-*-20261018T094550Z.log",
+    "artifacts/rocm/logs/r30b-bench-*-G*-T*-*.log"
+  ],
+  "not_done": [
+    "no code change in this window; no adoption",
+    "the profiled pipeline differs from production (fusions off) - a non-instrumented A/B is required for any candidate"
+  ]
+}

@@ -1,0 +1,206 @@
+{
+  "id": "iq3s-decode-campaign-fingerprint-20261018",
+  "what": "T01 pin: code, build, model, pack, config and hardware for the IQ3_S decode campaign",
+  "date": "2026-10-18",
+  "code": {
+    "worktree": "/home/zacch/projects/strata-r145",
+    "gitdir": "/home/zacch/projects/strata/.git/worktrees/strata-r145",
+    "branch": "refresh-0145",
+    "head": "d957494592ea0d9dd7420d6773e9bf7774594f0d",
+    "head_subject": "docs: GFX1100.md - production swapped to the 0.1.45 line (0.1.45-8eb3e85d, live 2026-10-18)",
+    "dirty": [
+      "GFX1100.md (DOC1 ledger export, uncommitted by design)"
+    ],
+    "upstream_base": "v0.1.45 477ac13cbe8e582c20484871ce459d20d82df09d (2026-10-16T20:39:03Z)",
+    "replayed_fork_commits": 35,
+    "pushed": false,
+    "unrelated_to_campaign": "the 849-PR mirror lives in this workspace under .scratch/pr-audit (no effect on the build)"
+  },
+  "build": {
+    "dir": "/home/zacch/projects/strata-r145/build-0145",
+    "stamp": "0.1.45-8eb3e85d",
+    "type": "Release",
+    "hip_arch": "gfx1100",
+    "hip_compiler": "/home/zacch/strata-rocm-experiments/20261003-231142/sdk/lib/llvm/bin/amdclang++",
+    "compiler_version": "AMD clang 24.0.0git (ROCm/llvm-project 5c7d6de6cb48f23bca5b95e77cc14e53e457d0e2)",
+    "strata_prefill_mmq": "ON",
+    "sdk": "/home/zacch/strata-rocm-experiments/20261003-231142/sdk",
+    "rocm_version": "10.2.0 (TheRock nightly SDK; amd-smi 27.1.0+bc176d4b)",
+    "baseline_command": "one-shot engine on the production args/env (scripts/rocm/r30-iq3s-decode-window.sh cell()); no rebuild"
+  },
+  "model": {
+    "release": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF, IQ3_S",
+    "shard1": {
+      "path": "/home/zacch/models/flash-next-iq3s/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+      "resolves_to": "/home/zacch/models/692a40d0341816e7a902267bb139f4efd00e047aa132d07490a14d75f8620fb3",
+      "bytes": 54817524224,
+      "sha256": "692a40d0341816e7a902267bb139f4efd00e047aa132d07490a14d75f8620fb3",
+      "sha256_source": "embedded in the downloader-assigned filename and named by the pack's native_experts.txt header; full content hash deferred to the window (run then, off the production page cache)"
+    },
+    "shard2": {
+      "path": "/home/zacch/models/flash-next-iq3s/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+      "resolves_to": "/mnt/LINUXWINSHARE/Backup/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+      "bytes": 28800138432,
+      "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113",
+      "sha256_source": "full content hash computed 2026-10-18 (sha256sum, local NVMe)"
+    }
+  },
+  "pack": {
+    "dir": "/home/zacch/strata-rocm-experiments/20261003-231142/packs/iq3_s",
+    "dense_bin_bytes": 1538035200,
+    "index_txt_bytes": 93697,
+    "index_txt_sha256": "5327bcb42f5ac9651dcc3432bb453c5b41f0d8e0b3d8d186f1992d2cf09a3e88",
+    "native_experts_txt_bytes": 3316,
+    "native_experts_txt_sha256": "f7c7a00033ded19da7615e545d0b79b2fa4f6e497a3d8fe3246df45256873694",
+    "expert_profile_sha256": "8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf",
+    "n_expert": 512,
+    "n_layers": 48,
+    "per_expert_bytes_all_layers": 98227200,
+    "expert_blob_bytes_total": 50292326400,
+    "format_table": {
+      "gate_up": {
+        "IQ2_S": 20,
+        "IQ3_XXS": 17,
+        "IQ3_S": 10,
+        "IQ4_XS": 1
+      },
+      "down": {
+        "IQ4_NL": 39,
+        "Q2_0": 9
+      }
+    },
+    "format_pairs": {
+      "IQ3_XXS/IQ4_NL": [
+        0,
+        7,
+        14,
+        16,
+        18,
+        22,
+        31,
+        33,
+        37,
+        38,
+        41,
+        42,
+        43,
+        46
+      ],
+      "IQ2_S/Q2_0": [
+        1,
+        8,
+        10,
+        13,
+        36
+      ],
+      "IQ2_S/IQ4_NL": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        9,
+        11,
+        15,
+        19,
+        23,
+        24,
+        26,
+        32,
+        34,
+        39
+      ],
+      "IQ3_XXS/Q2_0": [
+        12,
+        20,
+        30
+      ],
+      "IQ3_S/IQ4_NL": [
+        17,
+        25,
+        27,
+        28,
+        29,
+        35,
+        40,
+        44,
+        45
+      ],
+      "IQ3_S/Q2_0": [
+        21
+      ],
+      "IQ4_XS/IQ4_NL": [
+        47
+      ]
+    },
+    "per_expert_bytes_by_gate_up": {
+      "IQ2_S": 37120000,
+      "IQ3_XXS": 35609600,
+      "IQ3_S": 22835200,
+      "IQ4_XS": 2662400
+    },
+    "verified_against": "the attached backlog's table - identical counts (the backlog's layer counts are CONFIRMED, not assumed)"
+  },
+  "config": {
+    "file": "/home/zacch/strata-rocm-experiments/20261003-231142/serve-8081.json",
+    "sha256": "fd7231e3863c671c1e1ee4df1dd48e329e2df6073196655497efd332942076d2",
+    "args_canonical_sha256_20": "fc298a8befd3237400c4",
+    "env_canonical_sha256_20": "34a492a3d027064a8aee",
+    "hash_method": "sha256 of json.dumps(obj, sort_keys=True, separators=(',',':'))",
+    "exe": "/home/zacch/projects/strata-r145/build-0145/strata",
+    "args": [
+      "--pack",
+      "/home/zacch/strata-rocm-experiments/20261003-231142/packs/iq3_s",
+      "--native",
+      "/home/zacch/models/flash-next-iq3s/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+      "--ple-gguf",
+      "/home/zacch/models/flash-next-iq3s/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+      "--mtp",
+      "/mnt/LINUXWINSHARE/models/mtp/rt",
+      "--expert-profile",
+      "/home/zacch/strata-rocm-experiments/20261003-231142/data/expert-profile.bin",
+      "--expert-cache",
+      "auto",
+      "--spec",
+      "5",
+      "--kv",
+      "int8",
+      "--max-context",
+      "131072",
+      "--kv-resident",
+      "32768",
+      "--prefill",
+      "8192",
+      "--prompt-cache",
+      "6",
+      "--vram-reserve-mib",
+      "3072",
+      "--lookup-chain",
+      "2",
+      "--spec-min-p",
+      "0.70"
+    ],
+    "env": {
+      "STRATA_HIPBLASLT_TUNING": ".../gfx1100-hipblaslt-100500.txt",
+      "STRATA_PREFILL_RING": "96",
+      "STRATA_SELECT_WMMA": "1",
+      "STRATA_HIP_WMMA": "1",
+      "STRATA_SH_STREAM": "1",
+      "STRATA_ROUTE_TAIL_SKIP": "7"
+    },
+    "bf16_experiment": "NOT present in this tree or config; the backlog's 'earlier BF16 patch' is excluded by construction"
+  },
+  "hardware": {
+    "cpu": "AMD Ryzen 9 7900X 12-Core (24 threads)",
+    "ram_mib": 96118,
+    "gpu": "AMD Radeon RX 7900 XTX, gfx1100, VRAM 25753026560 B (23.98 GiB)",
+    "pcie": "16.0 GT/s x16 (PCIe 4.0 x16, sysfs current_link_speed/width)",
+    "kernel": "7.2.10-200.fc44.x86_64",
+    "devices": "/dev/kfd + /dev/dri/renderD128 present (danger-full-access session)"
+  },
+  "session_notes": {
+    "mem_available_before_stop_mib": 16561,
+    "why": "production 8081 holds the expert cache in RAM; the 68000 MiB cell gate is evaluated only after the service stop",
+    "production_untouched_at_pin_time": "8081 healthy, engine 0.1.45-8eb3e85d"
+  }
+}

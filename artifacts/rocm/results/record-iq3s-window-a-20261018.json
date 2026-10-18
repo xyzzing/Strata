@@ -1,0 +1,78 @@
+{
+  "id": "record-iq3s-window-a-20261018",
+  "what": "IQ3_S decode campaign window A: EXPDEC gate/up kernel matrix + bitwise parity, decode attribution, routing trace, and the down-arm kernel finding",
+  "date": "2026-10-18",
+  "window": {
+    "script": "scripts/rocm/r30-iq3s-decode-window.sh",
+    "stamp": "20261018T094159Z",
+    "production": "8081 stopped, restored healthy after ~24 s (trap)",
+    "gates": "MemAvailable 68587 MiB >= 68000; VRAM 2235 MiB <= 2600",
+    "parity": "6/6 PASS: iq_parity, iq_multi_parity, s2_expert_grouped_parity, default AND under STRATA_EXPDEC=1"
+  },
+  "attribution": {
+    "cell": "1K tokens, 128 new, production args/env, one-shot",
+    "decode_tps_with_timing": 73.83,
+    "speculation": "49 rounds of 8, 79/102 drafts accepted (0.775), 2.61 tokens/round",
+    "ms_per_round": 35.4,
+    "wait_for_rings_ms_per_round": 23.41,
+    "pool_ms_per_round": 3.567,
+    "host_ms_per_round": 0.014,
+    "commit_ms_per_round": 0.014,
+    "mtp_draft_ms_per_round": 4.156,
+    "cpu_experts_per_layer": "1.55 distinct / 2.15 routed",
+    "pcie_experts_per_layer": "1.08 distinct, 141/256 of the misses (55%)",
+    "adaptive_swaps": "1152 into VRAM tier, 0.056 ms/round",
+    "conclusion": "decode is GPU-bound: 66% of the round is the host waiting on the GPU; the grouped experts are ~15% of the round (5.2 of 35.4 ms) and run at ~690 GB/s (HBM-bound)"
+  },
+  "routing_trace": {
+    "file": "artifacts/rocm/logs/r30-iq3s-routing-20261018T094159Z.txt",
+    "parser": "scripts/rocm/r30-routing_stats.py",
+    "records": 14496,
+    "k": "10 for every record (top-10 routing)",
+    "rows_per_layer": 302,
+    "draft_rounds": 90,
+    "rows_per_round": 3.36,
+    "entries": 144960,
+    "implication": "the real verify-window envelope is G ~= 34, T ~= 1, not the denser G20 T4 used by the first bench pass"
+  },
+  "kernel_matrix_gate_up": {
+    "shape": "layers 0,1,2,8,12,17,21,47 = the 7 real format pairs; gu sums over 8 layers, two runs each; 0 differing in every cell",
+    "G20T4": {"def": 922.2, "expdec": 991.1, "expdec_r2": 953.5, "expdec_minb2": 999.8, "expdec_r2_minb2": 960.4},
+    "G8T1": {"def": 353.6, "expdec": 375.7, "expdec_r2": 351.9, "expdec_minb2": 378.0, "expdec_r2_minb2": 353.4},
+    "decision": "K1 REJECTED: EXPDEC gate/up is 3-8% slower at the grouped shape and a tie at single-token; a slower kernel cannot clear the +2% e2e gate"
+  },
+  "down_finding": {
+    "config": "STRATA_EXPDEC=1 STRATA_EXPDEC_DOWN=1 STRATA_EXPDEC_D20=1",
+    "shape": "G34 T1 (real envelope), per-layer down time, first run of each process",
+    "per_layer_us": {
+      "0 IQ3_XXS/IQ4_NL": {"def": 41.8, "expdown": 31.6, "delta_pct": -24.4},
+      "1 IQ2_S/Q2_0": {"def": 42.8, "expdown": 28.4, "delta_pct": -33.6},
+      "2 IQ2_S/IQ4_NL": {"def": 40.3, "expdown": 31.5, "delta_pct": -21.8},
+      "8 IQ2_S/Q2_0": {"def": 42.8, "expdown": 28.3, "delta_pct": -33.9},
+      "12 IQ3_XXS/Q2_0": {"def": 44.1, "expdown": 30.8, "delta_pct": -30.2},
+      "17 IQ3_S/IQ4_NL": {"def": 41.3, "expdown": 31.8, "delta_pct": -23.0},
+      "21 IQ3_S/Q2_0": {"def": 44.5, "expdown": 30.2, "delta_pct": -32.1},
+      "47 IQ4_XS/IQ4_NL": {"def": 40.6, "expdown": 32.0, "delta_pct": -21.2}
+    },
+    "expected_e2e": "~11 us/layer saved x 48 layers = 0.53 ms/round of 35.4 ms = ~1.5% (below the 2% gate; e2e decides in window B)",
+    "decision": "K2 CANDIDATE: bitwise-correct (same parity suite) and faster on every down format; e2e gate in window B"
+  },
+  "logs": [
+    "artifacts/rocm/logs/r30-iq3s-window-20261018T094159Z.log",
+    "artifacts/rocm/logs/r30-iq3s-cell-attr-1k-20261018T094159Z.log",
+    "artifacts/rocm/logs/r30-iq3s-cell-attr-routing-20261018T094159Z.log",
+    "artifacts/rocm/logs/r30-iq3s-bench-*-20261018T094159Z.log",
+    "artifacts/rocm/logs/r30b-bench-{def,expdec,expdown}-G{34-T1,20-T2,10-T6,48-T1}.log",
+    "artifacts/rocm/logs/r30-iq3s-routing-20261018T094159Z.txt"
+  ],
+  "deviations": [
+    "expdec_bench is CUDA-only in CMakeLists (EXCLUDE_FROM_ALL under STRATA_ENABLE_CUDA); the matrix ran through native_expert_bench + the parity ctests instead",
+    "the one-shot path does not print the STRATA_DECODE_TIMING / STRATA_VERIFY_PROFILE stage line (docs: serve path) - window B runs the serve path",
+    "window A's e2e block was skipped after EXPDEC lost the kernel bench; baseline cells deferred to window B"
+  ],
+  "not_done": [
+    "baseline e2e cells (1K/32K/128K) - window B",
+    "GPU stage profile - window B",
+    "the down arm e2e - window B"
+  ]
+}

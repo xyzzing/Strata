@@ -1,0 +1,56 @@
+{
+  "id": "record-iq3s-second-queue-20261018",
+  "what": "second follow-up queue: live-env re-baseline and re-profile, route-prior tuning + 20-prompt quality, T08 sweeps, hygiene, upstream watch, dormant-branch decision",
+  "date": "2026-10-18",
+  "rebaseline": {
+    "script": "scripts/rocm/r31a-rebaseline.sh", "stamp": "20261018T145719Z",
+    "cells_1k": [141.03, 101.83, 104.50], "acceptance_1k": ["207/207", "200/200", "203/203"],
+    "cells_32k": [74.00, 73.07], "cells_128k": [51.98, 60.06], "cell_262k": [45.12],
+    "prefill": {"1k": [897.7, 836.8, 907.8], "32k": [2395.2, 2337.0], "128k": [2420.7, 2386.8], "262k": [2314.5]},
+    "cpu_experts_per_layer": {"1k": [1.02, 0.87, 0.96], "32k": [0.63, 0.63], "128k": [0.95, 1.22], "262k": [0.78]},
+    "pcie_per_layer": {"1k": [0.66, 0.54, 0.63], "32k": [0.30, 0.30], "128k": [0.57, 0.82], "262k": [0.46]},
+    "note": "1K has two trajectories (100% acceptance -> ~140 tok/s, 200/200 -> ~102); 128K is noisy; cross-window absolutes are not comparable to the pre-adoption headline"
+  },
+  "profile_live": {
+    "windows": 45, "avg_T": 3.13, "tokens_per_window": 2.84, "ms_per_window": 35.08,
+    "verify": 30.62, "gpu_reach_wait": 24.78, "host": 2.47, "draft": 3.86,
+    "per_layer_window": {"cpu": "0.93 (1.46 entries)", "vram_hits": 28.10, "pcie": 0.58},
+    "stage_total": 28.89,
+    "stage_ms": {"waitB": 3.02, "HC": 5.2, "vram_hits": 4.07, "projections_attention": 8.6, "router_plan": 2.32, "shared_quant": 2.06, "head": 1.06},
+    "vs_window_b": "waitB 9.45 -> 3.02; the prior's extra router kernel is +0.77 ms for a 6.4 ms waitB saving"
+  },
+  "prior_262k_paired": {
+    "script": "scripts/rocm/r31a2-262k-prior-ab.sh", "stamp": "20261018T150543Z",
+    "off_tps": [34.48, 33.34, 33.87], "on_tps": [44.06, 45.12, 42.25],
+    "deltas_pct": [27.78, 35.33, 24.74], "median_pct": 27.78,
+    "cpu_off": "2.74-2.75 distinct / 4.45-4.48 routed", "cpu_on": "0.75-0.78 / 1.16-1.20",
+    "pcie_off": "2.32-2.33", "pcie_on": "0.43-0.46",
+    "reading": "the prior WINS at 262K; the earlier 45-vs-56.5 comparison was trajectory/epoch noise, not a regression"
+  },
+  "tuning": {
+    "script": "scripts/rocm/r31b-route-prior-tune.sh", "stamp": "20261018T151945Z",
+    "lambda_0_25_vs_0_5": -47.15, "lambda_0_75_vs_0_5": -38.67,
+    "tailskip_0_prior_vs_off": "107.76-108.19 vs 75.86-78.34 tok/s (+38-43%)",
+    "quality_battery": {"script": "scripts/rocm/r31b2-quality-battery.sh", "off": "20/20", "live_0_5": "20/20", "regressions": "none"}
+  },
+  "t08_sweeps": {
+    "script": "scripts/rocm/r31c-t08-sweeps.sh", "stamp": "20261018T153041Z",
+    "reserve_2048_vs_3072": [-40, -48], "reserve_4096_vs_3072": [-11, -11],
+    "workers_9_vs_auto": ["+1.1", "-7.6"], "workers_13_vs_auto": ["-7.8", "-0.1"],
+    "verdict": "live values stand: reserve 3072, pool-workers auto",
+    "lookahead_stats": "not captured (needs >=100 windows; a 128-token run has ~45)"
+  },
+  "hygiene": {
+    "script": "scripts/rocm/r31d-hygiene.sh", "stamp": "20261018T153626Z",
+    "shard2_sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113",
+    "spec_off": "IMPOSSIBLE on a native pack by design: rc=2, \"is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK\"",
+    "llc_bench": {"G8_all_us": [32.2, 31.8], "G64_all_us": [217.0, 217.8], "G64_gu": "111.4 us at 721 GB/s", "per_expert": "4.0 vs 3.4 us", "reading": "no cliff past the 96 MB Infinity Cache; the grouped kernel is bandwidth-bound either way"},
+    "graph_replay": "covered by the engine windows (captured graphs; EXPDEC ran inside them in window A), not a separate test"
+  },
+  "upstream": {"main": "477ac13c (v0.1.45, 2026-10-16)", "commits_after_tag": 0, "pr_3024": "OPEN, updated 2026-10-18T13:57, gfx12-only so far"},
+  "dormant_branches": {
+    "2514": "KEEP on the refresh line (ed3606a6): 9 lines, default-OFF, dispatch-neutral at 131K; re-test if upstream merges its own 262K top-k or the wide-kernel dispatch changes",
+    "2690": "KEEP as a standalone branch (3f04756b), not merged: 226-line verify.cpp diff, and the prior cut CPU rows 60-75% so its premise weakened; re-test on a host/verify-structure change, a heavier CPU workload, or upstream landing it"
+  },
+  "logs": ["artifacts/rocm/logs/r31a-rebaseline-20261018T145719Z.log", "artifacts/rocm/logs/r31a2-262k-prior-20261018T150543Z.log", "artifacts/rocm/logs/r31b-prior-tune-20261018T151945Z.log", "artifacts/rocm/logs/r31b2-battery-20261018T152844Z.log", "artifacts/rocm/logs/r31c-t08-20261018T153041Z.log", "artifacts/rocm/logs/r31d-hygiene-20261018T153626Z.log"]
+}

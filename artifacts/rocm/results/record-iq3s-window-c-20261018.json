@@ -1,0 +1,51 @@
+{
+  "id": "record-iq3s-window-c-20261018",
+  "what": "IQ3_S #2514 port gate at 262K: wide vs PER_MAX register decode top-k on gfx1100",
+  "date": "2026-10-18",
+  "port": {
+    "commit": "ed3606a6 (refresh-0145): qsa top-k - the 262K-context decode window can take the PER_MAX register kernel (#2514 port, opt-in STRATA_TOPK_DECODE_REG=1)",
+    "change": "src/kernels/cuda/qsa_select.cu: under __HIPCC__, fit = TK_T * ((counted || topk_decode_reg) ? TK_PER_MAX : TK_PER); the env is default OFF (the PR defaults it on; the fork keeps experiments opt-in until the gate)",
+    "dispatch_finding": "the PR's premise does not hold on 0.1.45: reach > fit already goes to the WIDE kernel (campaign3 / 82922f55), not the one-CTA ref; 131K decode takes the register kernel either way (32,770 <= 33,792). The port changes only the 262K tier: 65,538 blocks, wide -> register<PER_MAX>",
+    "binary": "build-0145/strata rebuilt in place, sha256 b0d443f9efc3ab4abd6e6b21bc0f195e897575c9ff4385cc92ee1501dcea8351; the STRATA_VERSION string stays 0.1.45-8eb3e85d (baked at configure time) - the commit is the provenance",
+    "production_impact": "behavior-neutral at the configured 131072 context (same dispatch both ways); the running 8081 process was restarted onto this binary by the window trap, health ok, engine stamp unchanged"
+  },
+  "window": {
+    "script": "scripts/rocm/r30c-iq3s-262k-topk-window.sh",
+    "stamp": "20261018T100324Z",
+    "gates": "MemAvailable 69,744 MiB; VRAM 1,753 MiB",
+    "production": "stopped and restored healthy after ~24 s"
+  },
+  "parity": {
+    "qsa_topk_parity": "PASS (default and STRATA_TOPK_DECODE_REG=1)",
+    "qsa_topk_parity_reg_always": "PASS (default and STRATA_TOPK_DECODE_REG=1)",
+    "meaning": "same ids under both dispatches - the port is exact by construction"
+  },
+  "cells": {
+    "config": "261,888-token prompt, --max-context 262144, 64 new tokens, production args/env; arms: unset (wide) vs STRATA_TOPK_DECODE_REG=1 (register)",
+    "pairs": [
+      {"base_tps": 54.11, "reg_tps": 56.52, "d_tps_pct": 4.45},
+      {"base_tps": 56.67, "reg_tps": 56.58, "d_tps_pct": -0.16},
+      {"base_tps": 56.67, "reg_tps": 56.46, "d_tps_pct": -0.37}
+    ],
+    "median_d_tps_pct": -0.16,
+    "median_d_ms_per_round_pct": 0.17,
+    "spread_pct": 4.44,
+    "acceptance": "identical in every pair (34 of 40)",
+    "first_pair_note": "the +4.45% is the first base cell running cold (54.11); once warm both arms sit at ~56.5 - not a kernel effect"
+  },
+  "verdict": {
+    "gate": "median ms/round <= -3% + same ids + no pair > +2%",
+    "result": "FAIL (median +0.17%, spread 4.44) -> NOT ADOPTED",
+    "disposition": "the port stays in the tree as a dormant opt-in (default OFF, same ids, parity-tested); no config change; a 262K-context run may set STRATA_TOPK_DECODE_REG=1 for the register dispatch, but on this card the wide kernel is already equivalent"
+  },
+  "deep_tier_data_point": {
+    "value": "262K decode 56.5 tok/s on 0.1.45 with this cell's config (TAIL_SKIP=7 + lookup-chain 2 + spec 5 + SH_STREAM + kv-resident 32768 + max-context 262144)",
+    "reference": "69.3 tok/s @262K recorded on the 0.1.43.1 line (record-r1292-resweep-20261013), whose sweep config is not identical",
+    "disposition": "NOT a like-for-like comparison - flagged for the R31 deep-tier re-measure (ledger pending item 1), not claimed as a regression"
+  },
+  "logs": [
+    "artifacts/rocm/logs/r30c-topk-window-20261018T100324Z.log",
+    "artifacts/rocm/logs/r30c-topk-cell-*-20261018T100324Z.log",
+    "artifacts/rocm/logs/ctest-r30c-*-qsa_topk_parity*.log"
+  ]
+}

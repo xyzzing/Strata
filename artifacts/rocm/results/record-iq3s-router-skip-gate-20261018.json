@@ -1,0 +1,26 @@
+{
+  "id": "record-iq3s-router-skip-gate-20261018",
+  "what": "first v2 experiment: with STRATA_ROUTE_PRIOR on, the router's own top-10 is dead work; implemented an opt-in skip, proved exactness analytically, gated on paired cells - REJECTED",
+  "date": "2026-10-18",
+  "change": {
+    "commit": "662d4736 (reverted after the gate)",
+    "env": "STRATA_ROUTER_SKIP_TOPK=1 (opt-in, default OFF)",
+    "what": "when the route prior is active (512 experts, k=10, residency table present) the prior re-picks the top-10 from the same logits and overwrites ids/weights, so native_router_top10_multi's selection is dead; the skip drops that one launch per layer",
+    "exactness": "PROVEN by inspection: route_prior_k reads only logits and res; ids/weights are write-only outputs. A same-process trace comparison was not possible; the cross-process --dump-routing comparison differed only because the two runs took different trajectories (99 vs 93 drafts, the known greedy restart drift)"
+  },
+  "windows": {
+    "r31g": {"script": "scripts/rocm/r31g-router-skip-gate.sh", "stamp": "20261018T155624Z",
+             "1k": {"d_tps_pct": [-7.38, 0.42, 2.91, 25.07, 10.79], "median": 2.91, "wins": "4/5"},
+             "32k": {"d_tps_pct": [1.07, 3.83], "median": 2.45, "wins": "2/2"},
+             "128k": {"d_tps_pct": [-5.34, 5.23], "median": -0.05, "wins": "1/2"},
+             "note": "the trace cells failed (--dump-routing was passed to env, rc=127) so the window verdict was a false-negative NOT ADOPTED"},
+    "r31h": {"script": "scripts/rocm/r31h-router-skip-confirm.sh", "stamp": "20261018T160824Z",
+             "1k": {"d_tps_pct": [10.95, 10.88, 1.31, -6.92, -4.49], "median": 1.31, "wins": "3/5",
+                    "accepted": "197/197/207/207/207 vs 207/207/207/197/197"},
+             "32k": {"d_tps_pct": [1.17, 14.80], "median": 7.99, "wins": "2/2"},
+             "128k": {"d_tps_pct": [-8.52, 7.41], "median": -0.56, "wins": "1/2"},
+             "trace": "byte-differ at 232761 due to trajectory drift, not the change"}
+  },
+  "verdict": "REJECTED (not adopted): 1K median +1.31% with 3/5 wins misses the pre-declared >=+2.0% / 4-of-5 gate; 32K and 128K are inside the trajectory band (accepted counts swing 197<->207 and 24<->32). The redundancy is real but worth <2% - the native multi top-10 is one cheap launch per layer.",
+  "next": "the runner-up experiment (batch the small GEMV calls z/rec/ab + shared into fewer launches) is the remaining defensible candidate at ~1.7-2.9%; no other single bounded change clears the gate on the current profile"
+}

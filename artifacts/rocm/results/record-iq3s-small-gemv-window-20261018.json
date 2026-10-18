@@ -1,0 +1,18 @@
+{
+  "id": "record-iq3s-small-gemv-window-20261018",
+  "what": "one-window decision test of the runner-up: batching the small GEMV calls",
+  "date": "2026-10-18",
+  "premise_correction": "z/rec/ab are stamps INSIDE the fused GDN kernel, not separate launches; the only separate small GEMVs are the shared expert's gate/up/down and the k/v projections, so the batch target is the shared block (~3 calls/layer), not five",
+  "measurements": {
+    "bench_1_3_4_cols_us": {
+      "shared_gate_up": [6.0, 8.2, 8.3], "shared_down": [7.4, 9.5, 10.2], "k_v": [4.5, 5.8, 5.9],
+      "hc_up": [14.4, 21.1, 22.4], "hc_down": [7.3, null, null], "head": [825.6, null, null]
+    },
+    "efficiency_pct_of_750": {"shared_gate_up": "39 -> 28", "shared_down": "32 -> 23", "k_v": "41 -> 31", "hc_up": "32 -> 21", "hc_down": "64 (1 col)", "head": "109"},
+    "in_situ_r31f_spec8": {"shared_quant": 1.57, "hc_up_two_halves": 1.50, "kv": 0.29, "unit": "ms/window at T=3.17"},
+    "window_run": "1K/256 one-shot on the reverted binary: 114.04 tok/s (trajectory band); the one-shot does not print the serve-path stage lines, so in-situ numbers are from r31f"
+  },
+  "analysis": "the shared block's three calls cost ~26 us/layer at T=3.17 (~1.24 ms/window), matching the 1.57 ms shared+quant stage; a 3-job single launch could save the launch/teardown plus some occupancy fill, bounded by ~0.4-0.5 ms/window (1.2-1.5% of the 35 ms round) because the weights (1.74 MB each) must be read regardless and the shapes are latency-bound at 23-39% of the wall",
+  "verdict": "NOT WORTH BUILDING: the bound (1.2-1.5%) sits below the pre-declared >=2% gate, and the kernel risk (three forms/act images, per-job shape) is high for that. The runner-up is closed; no code change.",
+  "caveat": "the bench uses synthetic Q8_0 at the engine's shapes; the engine stores the HC weights bf16 (6.55 MB per matrix) and the shared tensors at their own quant types, so these are shape/pattern bounds, not exact engine bytes"
+}

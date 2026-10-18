@@ -1,0 +1,28 @@
+{
+  "id": "record-iq3s-v01-u01-20261018",
+  "what": "v2 Phase 0/1: backlog adoption with the local-LLM executor removed; V01 boundary table; U01 component/primitives audit; review checkpoint",
+  "date": "2026-10-18",
+  "phase0": {
+    "backlog": "artifacts/rocm/iq3s-decode-campaign-20261018/tasks-v2.md (adopted; deployment note with role map and status reconciliation)",
+    "v1": "tasks-v1-superseded.md (archived, superseded header kept for history)",
+    "local_model_decision": "REMOVED as executor: no relay mechanism exists; the only local models are the specimen on 8081 and the off-limits 8080 llama.cpp; the DSH agent implements directly and a fresh-context subagent reviews at the mandatory checkpoints",
+    "live_state": "0.1.45-8eb3e85d + ROUTE_PRIOR=0.5, GDN_CHUNKED=1, PF_GEMM=1, PF_PAD=1"
+  },
+  "v01": {
+    "doc": "artifacts/rocm/iq3s-decode-timeline-20261018.md",
+    "basis": "serve-path profile from record-iq3s-second-queue (45 windows, avg T 3.13, round 35.08 ms, stage 28.89 ms)",
+    "stage_ms": {"hc": 5.20, "projections": 8.60, "experts": 4.07, "router_plan": 2.32, "shared_quant": 2.06, "head": 1.06, "waitA_B": 3.02, "draft": 3.86},
+    "derived_gbps": {"hc": 758, "projections": 558, "experts": 730, "head": 734},
+    "finding": "HC, experts and head are at HBM bandwidth; the dense projections are the only material efficiency gap (~26% under the neighbouring kernels), worth ~2.0 ms/window (~5.8%) if closed",
+    "open_question": "projection gap cause: load layout vs occupancy (counters blocked)",
+    "recommendation": "V05 scoped to the dense projection layout, preceded by one discriminating micro-benchmark (current vs 1024-B row-padded vs column-interleaved, T=1/T=4, achieved GB/s; falsifier: <10% gain -> occupancy, drop V05, take the router/plan fusion)"
+  },
+  "u01": {
+    "doc": "artifacts/rocm/iq3s-u01-audit-20261018.md",
+    "pin": {"sdk": "TheRock 10.2.0", "hip": "7.17.26392", "compiler": "amdclang 24.0.0git (5c7d6de6)", "hipblaslt": "1.5.0", "rocblas": "5", "comgr": "3.5.0", "ck": "headers present, unused", "rocwmma": "used by select arm + GDN WY", "profilers": "rocprof-compute/sys present, counters blocked by perf_event_paranoid=2"},
+    "classifications": {"ck_tile": "REUSABLE_PRIMITIVE at high cost; not adopted", "host_numa_vmm": "NOT_APPLICABLE on evidence", "rocshmem": "NOT_APPLICABLE", "rocwmma_compiler": "ALREADY_FIXED for supported primitives; resource report is the actionable item", "counters": "BLOCKED by host policy"},
+    "nightly_decision": "no second nightly installed; reopen triggers: codegen-shaped cause, a pinned upstream fix for a path we use, or a compiler-side next bottleneck"
+  },
+  "review": "fresh-context reviewer spawned at the bottleneck checkpoint; findings to be incorporated before Phase 2 code",
+  "next": "fold review findings in, then implement the V05 discriminator micro-benchmark and run it in one short window"
+}
