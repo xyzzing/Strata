@@ -2697,7 +2697,21 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                          (any_card || topk_active_turing_device());
 #endif
     const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
+#if defined(__HIPCC__)
+    // #2514 (gfx1100 decode at 262K): a decode call has no active count, so `fit` stays TK_T * TK_PER and a
+    // 262,144-token context's 65,538 blocks go to the WIDE kernel (the `reach > fit` branch below). The PER_MAX
+    // register kernel holds that capacity and reads only the live blocks; the same ids (qsa_topk_parity). #2514
+    // measured register vs the one-CTA ref on a 7900 XTX split; our base no longer falls to the ref, so this is a
+    // wide-vs-register choice that needs its own 262K cell. The fork keeps it OPT-IN behind =1 until that cell
+    // passes; unset preserves the wide dispatch (=0 is the PR's own spelling for the same default).
+    static const bool topk_decode_reg = [] {
+        const char* v = std::getenv("STRATA_TOPK_DECODE_REG");
+        return v != nullptr && v[0] == '1';
+    }();
+    const int64_t fit = (int64_t) TK_T * ((counted || topk_decode_reg) ? TK_PER_MAX : TK_PER);
+#else
     const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);
+#endif
 #if defined(__HIPCC__)
     // gfx1201: below ~28K cells (7,168 blocks) the 1,024-thread kernel's fixed cost loses to the ref.  STRATA_TOPK_REG_MIN_BLOCKS
     // moves the line (0: the register kernel always); gfx1151's table sets 4096, the crossover with the cooperative scan
