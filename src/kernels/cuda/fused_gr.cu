@@ -372,6 +372,13 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     const int d0 = blockIdx.x * UPM_COLS;
     for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
     __syncthreads();
+    // tasks-v6 P1: the up stage's gate depends only on (token, c) - the single-token gr_up_kernel already holds it
+    // in gw[HC].  Computing it once here instead of once per (row, token) is bitwise (same sigmoid, same inputs).
+    float gw[MAX_T][HC];
+    if (lane < T) {
+        const FusedGrArgs& a0 = m.a[lane];
+        for (int c = 0; c < HC; ++c) gw[lane][c] = a0.apply ? 2.0f * sigmoidf_(a0.inj_prev[c] / (float) HC) : 0.0f;
+    }
     for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
         uint4 qa = make_uint4(0, 0, 0, 0), qb = make_uint4(0, 0, 0, 0);
@@ -412,7 +419,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
         }
         if (lane < T) {
             if (apply) {
-                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                rv = fmaf(bo, gw[lane][c], rv);   // P1: hoisted (same value; the fmaf with 0.0f is the identity)
                 m.a[lane].R_out[i] = rv;
             }
             const float x = rv * wn * rsc;
