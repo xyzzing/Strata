@@ -1870,7 +1870,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                           NE, n, cs);
                 // W3a: with STRATA_ROUTE_PRIOR on, route_prior_top10 below recomputes the selection and the
                 // weights from this same logits block and overwrites ids/w - the top-k launch is redundant.
-                if (route_prior <= 0.0f)
+                if (route_prior <= 0.0f || std::getenv("STRATA_W3A_NOSKIP") != nullptr)   // diag: force the redundant launch
                     native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
