@@ -1,0 +1,83 @@
+# Compile-validate any ref (e.g. a pr/* branch) in the same vendor containers release.yml
+# uses: CUDA sm_89 and HIP gfx1100. Hosted runners have no GPUs — this is compile validation
+# only; per-backend runtime evidence stays with the caller (same law as release.yml).
+# Trigger: repository_dispatch {event_type: pr-backend-builds, client_payload: {ref: ...}}
+# or workflow_dispatch with the ref input.
+name: pr-backend-builds
+
+on:
+  repository_dispatch:
+    types: [pr-backend-builds]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'branch or sha to build'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.name }} ${{ github.event.client_payload.ref || inputs.ref }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cuda-sm_89
+            image: nvidia/cuda:13.0.0-devel-ubuntu24.04
+            configure: >
+              -DSTRATA_ENABLE_CUDA=ON
+              -DSTRATA_ENABLE_HIP=OFF
+              -DCMAKE_CUDA_ARCHITECTURES=89
+          - name: hip-gfx1100
+            # 10.1, not 7.x: the 7.1 image's hipclang rejects upstream iq_kernels.cu's
+            # `__shared__ alignas(16)` (same bump as release.yml notes)
+            image: rocm/dev-ubuntu-24.04:10.1.0-full
+            configure: >
+              -DSTRATA_ENABLE_HIP=ON
+              -DSTRATA_ENABLE_CUDA=OFF
+              -DCMAKE_HIP_ARCHITECTURES=gfx1100
+              -DCMAKE_PREFIX_PATH=/opt/rocm
+    container:
+      image: ${{ matrix.image }}
+    env:
+      REF: ${{ github.event.client_payload.ref || inputs.ref }}
+    steps:
+      - name: Install build tools
+        run: >
+          apt-get update && apt-get install -y --no-install-recommends
+          cmake ninja-build git ca-certificates
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+          fetch-depth: 0
+      - name: Fetch the pinned llama.cpp (ggml)
+        run: |
+          pin="$(grep -oE 'GIT_TAG [0-9a-f]{40}' CMakeLists.txt | grep -oE '[0-9a-f]{40}')"
+          git clone --quiet https://github.com/ggml-org/llama.cpp.git /tmp/strata-llamacpp
+          git -C /tmp/strata-llamacpp checkout --quiet "$pin"
+          echo "llama.cpp pin: $pin"
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DSTRATA_GGML_DIR=/tmp/strata-llamacpp
+          ${{ matrix.configure }}
+      - name: Build the engine
+        run: cmake --build build --parallel "$(nproc)" --target strata
+      - name: Summarize
+        run: |
+          echo "ref: $REF" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "backend: ${{ matrix.name }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "result: strata binary built (compile-validated, no GPU on hosted runners)" | tee -a "$GITHUB_STEP_SUMMARY"
+          ls -la build/strata | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.name }}-${{ github.run_id }}
+          path: build/CMakeCache.txt
+          if-no-files-found: ignore
