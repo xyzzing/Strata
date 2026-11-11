@@ -282,6 +282,13 @@ measurement, and the knobs that did not win are recorded too.
 Opt-in flags, methodology, the rejected-with-records list and the evidence trail:
 **[GFX1100.md](GFX1100.md)**.
 
+The current production knob matrix — the `0.1.55` line, deployed 2026-11-07, with per-knob
+measured provenance and the default-off recorded arms — is
+**[RDNA3-DEPLOYMENT.md](https://github.com/xyzzing/Strata/blob/refresh-0155/RDNA3-DEPLOYMENT.md)**
+(on the `refresh-0155` branch). The full experiment ledger, exported for other RDNA3 users
+(adopted stack + ~80 measured negatives with the protocol that closed them):
+**[xyzzing/rdna3-inference-ledger](https://github.com/xyzzing/rdna3-inference-ledger)**.
+
 ## Using this fork on an RX 7900 XTX
 
 Linux with the `amdgpu` driver (no system ROCm needed), a C++ compiler and git, 64 GB of RAM and
